@@ -1,0 +1,115 @@
+name: Live Arbitrage Signaler
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      target_payout_usd:
+        description: "Equalized payout target per outcome in USD"
+        required: true
+        default: "500"
+      min_profit_pct:
+        description: "Minimum net arbitrage edge percentage"
+        required: true
+        default: "1.5"
+      discovery_platforms:
+        description: "Platforms to discover during the indexer stage"
+        required: true
+        default: "polymarket,kalshi,oddspapi,azuro,dexsport"
+      listener_platforms:
+        description: "Live WebSocket listener platforms"
+        required: true
+        default: "polymarket,kalshi,azuro,oddspapi"
+      dry_run:
+        description: "Log alerts without sending Telegram messages"
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: wc-arbbot-live-signaler
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  live-signaler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      LOG_LEVEL: INFO
+      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY }}
+      TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
+      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+      KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
+      KALSHI_ACCESS_KEY: ${{ secrets.KALSHI_ACCESS_KEY }}
+      KALSHI_BEARER_TOKEN: ${{ secrets.KALSHI_BEARER_TOKEN }}
+      KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+      AZURO_WS_URL: ${{ vars.AZURO_WS_URL }}
+      AZURO_WS_SUBSCRIBE_PAYLOAD: ${{ vars.AZURO_WS_SUBSCRIBE_PAYLOAD }}
+      POLYMARKET_WS_URL: ${{ vars.POLYMARKET_WS_URL }}
+      KALSHI_WS_URL: ${{ vars.KALSHI_WS_URL }}
+      ODDSPAPI_WS_URL: ${{ vars.ODDSPAPI_WS_URL }}
+      ODDSPAPI_BASE_URL: ${{ vars.ODDSPAPI_BASE_URL }}
+      ODDSPAPI_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_TOURNAMENT_IDS }}
+      ODDSPAPI_TOURNAMENT_NAME: ${{ vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
+      ODDSPAPI_BOOKMAKERS: ${{ vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
+      WC_ARBBOT_WINDOW_HOURS: ${{ vars.WC_ARBBOT_WINDOW_HOURS || '48' }}
+      WC_ARBBOT_PLATFORMS: ${{ inputs.discovery_platforms || vars.WC_ARBBOT_PLATFORMS || 'polymarket,kalshi,oddspapi,azuro,dexsport' }}
+      SIGNALER_PLATFORMS: ${{ inputs.listener_platforms || vars.SIGNALER_PLATFORMS || 'polymarket,kalshi,azuro,oddspapi' }}
+      SIGNAL_TARGET_PAYOUT_USD: ${{ inputs.target_payout_usd || vars.SIGNAL_TARGET_PAYOUT_USD || '500' }}
+      SIGNAL_MIN_PROFIT_PCT: ${{ inputs.min_profit_pct || vars.SIGNAL_MIN_PROFIT_PCT || '1.5' }}
+      SIGNAL_DRY_RUN: ${{ inputs.dry_run || vars.SIGNAL_DRY_RUN || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in ODDSPAPI_KEY TELEGRAM_BOT_KEY TELEGRAM_GROUP_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error title=Missing secret::$name is required in repository secrets"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Build container
+        run: docker build -t wc-arbbot:latest .
+
+      - name: Run live signaler
+        run: |
+          docker run --rm \
+            --name wc-arbbot-live \
+            -e LOG_LEVEL \
+            -e ODDSPAPI_KEY \
+            -e TELEGRAM_BOT_KEY \
+            -e TELEGRAM_GROUP_ID \
+            -e KALSHI_API_KEY \
+            -e KALSHI_ACCESS_KEY \
+            -e KALSHI_BEARER_TOKEN \
+            -e KALSHI_PRIVATE_KEY \
+            -e AZURO_WS_URL \
+            -e AZURO_WS_SUBSCRIBE_PAYLOAD \
+            -e POLYMARKET_WS_URL \
+            -e KALSHI_WS_URL \
+            -e ODDSPAPI_WS_URL \
+            -e ODDSPAPI_BASE_URL \
+            -e ODDSPAPI_TOURNAMENT_IDS \
+            -e ODDSPAPI_TOURNAMENT_NAME \
+            -e ODDSPAPI_BOOKMAKERS \
+            -e WC_ARBBOT_WINDOW_HOURS \
+            -e WC_ARBBOT_PLATFORMS \
+            -e SIGNALER_PLATFORMS \
+            -e SIGNAL_TARGET_PAYOUT_USD \
+            -e SIGNAL_MIN_PROFIT_PCT \
+            -e SIGNAL_DRY_RUN \
+            wc-arbbot:latest
