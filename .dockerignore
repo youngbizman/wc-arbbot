@@ -1,0 +1,7 @@
+.git
+__pycache__/
+*.py[cod]
+markets_smoke.json
+taxonomy_smoke.json
+.pytest_cache/
+.mypy_cache/

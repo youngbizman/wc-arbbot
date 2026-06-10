@@ -901,6 +901,11 @@ class LiveSignaler:
     async def run(self) -> None:
         listeners: list[ReconnectingListener] = []
         enabled = set(self.config.platforms)
+        if not self.taxonomy.clusters and not bool_env("SIGNAL_ALLOW_EMPTY_TAXONOMY", False):
+            raise RuntimeError(
+                "Taxonomy contains 0 canonical clusters. Run indexer/nlp_mapper with discovery data "
+                "before starting the live signaler, or set SIGNAL_ALLOW_EMPTY_TAXONOMY=true for a dry connectivity run."
+            )
         if "polymarket" in enabled:
             listeners.append(PolymarketListener(self.config, self.engine, self.taxonomy))
         if "kalshi" in enabled:

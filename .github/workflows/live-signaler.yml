@@ -17,11 +17,11 @@ on:
       discovery_platforms:
         description: "Platforms to discover during the indexer stage"
         required: true
-        default: "polymarket,kalshi,oddspapi,azuro,dexsport"
+        default: "polymarket,kalshi,oddspapi"
       listener_platforms:
         description: "Live WebSocket listener platforms"
         required: true
-        default: "polymarket,kalshi,azuro,oddspapi"
+        default: "polymarket,kalshi,oddspapi"
       dry_run:
         description: "Log alerts without sending Telegram messages"
         required: true
@@ -43,8 +43,8 @@ jobs:
     timeout-minutes: 355
     env:
       LOG_LEVEL: INFO
-      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY }}
-      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY }}
+      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
+      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
       TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
@@ -60,12 +60,15 @@ jobs:
       ODDSPAPI_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_TOURNAMENT_IDS }}
       ODDSPAPI_TOURNAMENT_NAME: ${{ vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
       ODDSPAPI_BOOKMAKERS: ${{ vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
+      POLYMARKET_DISCOVERY_JSON: /app/seed/polymarket_world_cup.json
+      KALSHI_DISCOVERY_JSON: /app/seed/kalshi_world_cup.json
       WC_ARBBOT_WINDOW_HOURS: ${{ vars.WC_ARBBOT_WINDOW_HOURS || '48' }}
-      WC_ARBBOT_PLATFORMS: ${{ inputs.discovery_platforms || vars.WC_ARBBOT_PLATFORMS || 'polymarket,kalshi,oddspapi,azuro,dexsport' }}
-      SIGNALER_PLATFORMS: ${{ inputs.listener_platforms || vars.SIGNALER_PLATFORMS || 'polymarket,kalshi,azuro,oddspapi' }}
+      WC_ARBBOT_PLATFORMS: ${{ inputs.discovery_platforms || vars.WC_ARBBOT_PLATFORMS || 'polymarket,kalshi,oddspapi' }}
+      SIGNALER_PLATFORMS: ${{ inputs.listener_platforms || vars.SIGNALER_PLATFORMS || 'polymarket,kalshi,oddspapi' }}
       SIGNAL_TARGET_PAYOUT_USD: ${{ inputs.target_payout_usd || vars.SIGNAL_TARGET_PAYOUT_USD || '500' }}
       SIGNAL_MIN_PROFIT_PCT: ${{ inputs.min_profit_pct || vars.SIGNAL_MIN_PROFIT_PCT || '1.5' }}
       SIGNAL_DRY_RUN: ${{ inputs.dry_run || vars.SIGNAL_DRY_RUN || 'false' }}
+      SIGNAL_ALLOW_EMPTY_TAXONOMY: "false"
 
     steps:
       - name: Checkout
@@ -111,10 +114,13 @@ jobs:
             -e ODDSPAPI_TOURNAMENT_IDS \
             -e ODDSPAPI_TOURNAMENT_NAME \
             -e ODDSPAPI_BOOKMAKERS \
+            -e POLYMARKET_DISCOVERY_JSON \
+            -e KALSHI_DISCOVERY_JSON \
             -e WC_ARBBOT_WINDOW_HOURS \
             -e WC_ARBBOT_PLATFORMS \
             -e SIGNALER_PLATFORMS \
             -e SIGNAL_TARGET_PAYOUT_USD \
             -e SIGNAL_MIN_PROFIT_PCT \
             -e SIGNAL_DRY_RUN \
+            -e SIGNAL_ALLOW_EMPTY_TAXONOMY \
             wc-arbbot:latest

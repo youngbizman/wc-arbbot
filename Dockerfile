@@ -18,6 +18,7 @@ RUN python -m pip install --upgrade pip && \
     python -m pip install -r requirements.txt
 
 COPY indexer.py nlp_mapper.py websocket_signaler.py telegram_bot.py ./
+COPY seed ./seed
 
 USER app
 
