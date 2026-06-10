@@ -43,7 +43,8 @@ jobs:
     timeout-minutes: 355
     env:
       LOG_LEVEL: INFO
-      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY }}
+      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY }}
+      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY }}
       TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
@@ -74,12 +75,15 @@ jobs:
         shell: bash
         run: |
           missing=0
-          for name in ODDSPAPI_KEY TELEGRAM_BOT_KEY TELEGRAM_GROUP_ID; do
+          for name in TELEGRAM_BOT_KEY TELEGRAM_GROUP_ID; do
             if [ -z "${!name}" ]; then
               echo "::error title=Missing secret::$name is required in repository secrets"
               missing=1
             fi
           done
+          if [ -z "$ODDSPAPI_KEY" ]; then
+            echo "::warning title=Missing OddsPapi key::ODDSPAPI_KEY was not injected. The bot will run, but Pinnacle and 1xBet coverage from OddsPapi will be skipped until the secret name/value is fixed."
+          fi
           exit "$missing"
 
       - name: Build container
@@ -91,6 +95,7 @@ jobs:
             --name wc-arbbot-live \
             -e LOG_LEVEL \
             -e ODDSPAPI_KEY \
+            -e ODDSPAPI_API_KEY \
             -e TELEGRAM_BOT_KEY \
             -e TELEGRAM_GROUP_ID \
             -e KALSHI_API_KEY \
