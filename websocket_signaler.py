@@ -552,6 +552,8 @@ class ReconnectingListener:
         raise NotImplementedError
 
     async def connect(self, url: str, headers: Mapping[str, str] | None = None) -> Any:
+        if not url.startswith(("ws://", "wss://")):
+            raise RuntimeError(f"{self.name} websocket URL must start with ws:// or wss://, got {url!r}")
         kwargs = {
             "ping_interval": self.config.ws_ping_interval_seconds,
             "ping_timeout": self.config.ws_ping_timeout_seconds,
@@ -570,7 +572,7 @@ class PolymarketListener(ReconnectingListener):
     def __init__(self, config: SignalerConfig, engine: SignalEngine, taxonomy: TaxonomyStore) -> None:
         super().__init__(config, engine)
         self.taxonomy = taxonomy
-        self.url = os.environ.get(
+        self.url = env_str(
             "POLYMARKET_WS_URL",
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         )
@@ -661,11 +663,11 @@ class KalshiListener(ReconnectingListener):
     def __init__(self, config: SignalerConfig, engine: SignalEngine, taxonomy: TaxonomyStore) -> None:
         super().__init__(config, engine)
         self.taxonomy = taxonomy
-        self.url = os.environ.get(
+        self.url = env_str(
             "KALSHI_WS_URL",
             "wss://api.elections.kalshi.com/trade-api/ws/v2",
         )
-        self.path = os.environ.get("KALSHI_WS_PATH", "/trade-api/ws/v2")
+        self.path = env_str("KALSHI_WS_PATH", "/trade-api/ws/v2")
         self.command_id = 1
         self.books: dict[str, dict[str, MutableOrderBook]] = defaultdict(
             lambda: {"yes": MutableOrderBook(), "no": MutableOrderBook()}
@@ -761,7 +763,7 @@ class AzuroListener(ReconnectingListener):
     def __init__(self, config: SignalerConfig, engine: SignalEngine, taxonomy: TaxonomyStore) -> None:
         super().__init__(config, engine)
         self.taxonomy = taxonomy
-        self.url = os.environ.get(
+        self.url = env_str(
             "AZURO_WS_URL",
             "wss://dev-streams.onchainfeed.org/v1/streams/feed",
         )
@@ -809,7 +811,7 @@ class OddsPapiListener(ReconnectingListener):
     def __init__(self, config: SignalerConfig, engine: SignalEngine) -> None:
         super().__init__(config, engine)
         self.api_key = os.environ.get("ODDSPAPI_KEY") or os.environ.get("ODDSPAPI_API_KEY")
-        base = os.environ.get("ODDSPAPI_WS_URL", "wss://api.oddspapi.io/v4/ws")
+        base = env_str("ODDSPAPI_WS_URL", "wss://api.oddspapi.io/v4/ws")
         self.url = f"{base}?apiKey={quote(self.api_key or '')}"
 
     async def run_once(self) -> None:
@@ -909,11 +911,21 @@ class LiveSignaler:
         if "polymarket" in enabled:
             listeners.append(PolymarketListener(self.config, self.engine, self.taxonomy))
         if "kalshi" in enabled:
-            listeners.append(KalshiListener(self.config, self.engine, self.taxonomy))
+            if has_kalshi_auth():
+                listeners.append(KalshiListener(self.config, self.engine, self.taxonomy))
+            elif bool_env("SIGNAL_REQUIRE_KALSHI", False):
+                raise RuntimeError("SIGNAL_REQUIRE_KALSHI=true but Kalshi WebSocket auth is not configured")
+            else:
+                LOGGER.warning("Skipping Kalshi live listener: Kalshi WebSocket auth is not configured")
         if "azuro" in enabled:
             listeners.append(AzuroListener(self.config, self.engine, self.taxonomy))
         if "oddspapi" in enabled:
-            listeners.append(OddsPapiListener(self.config, self.engine))
+            if os.environ.get("ODDSPAPI_KEY") or os.environ.get("ODDSPAPI_API_KEY"):
+                listeners.append(OddsPapiListener(self.config, self.engine))
+            elif bool_env("SIGNAL_REQUIRE_ODDSPAPI", False):
+                raise RuntimeError("SIGNAL_REQUIRE_ODDSPAPI=true but ODDSPAPI_KEY is not available")
+            else:
+                LOGGER.warning("Skipping OddsPapi live listener: ODDSPAPI_KEY is not available")
         if not listeners:
             raise RuntimeError("No signaler platforms enabled")
         LOGGER.info(
@@ -1029,6 +1041,14 @@ def kalshi_auth_headers(path: str) -> dict[str, str]:
     return headers
 
 
+def has_kalshi_auth() -> bool:
+    return bool(
+        os.environ.get("KALSHI_BEARER_TOKEN")
+        or os.environ.get("KALSHI_API_KEY")
+        or os.environ.get("KALSHI_ACCESS_KEY")
+    )
+
+
 def kalshi_signature(private_key_pem: str, path: str) -> dict[str, str]:
     try:
         from cryptography.hazmat.primitives import hashes, serialization
@@ -1111,6 +1131,13 @@ def bool_env(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_str(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip()
 
 
 def env_csv(name: str) -> list[str]:

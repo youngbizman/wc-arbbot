@@ -51,11 +51,11 @@ jobs:
       KALSHI_ACCESS_KEY: ${{ secrets.KALSHI_ACCESS_KEY }}
       KALSHI_BEARER_TOKEN: ${{ secrets.KALSHI_BEARER_TOKEN }}
       KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-      AZURO_WS_URL: ${{ vars.AZURO_WS_URL }}
+      AZURO_WS_URL: ${{ vars.AZURO_WS_URL || 'wss://dev-streams.onchainfeed.org/v1/streams/feed' }}
       AZURO_WS_SUBSCRIBE_PAYLOAD: ${{ vars.AZURO_WS_SUBSCRIBE_PAYLOAD }}
-      POLYMARKET_WS_URL: ${{ vars.POLYMARKET_WS_URL }}
-      KALSHI_WS_URL: ${{ vars.KALSHI_WS_URL }}
-      ODDSPAPI_WS_URL: ${{ vars.ODDSPAPI_WS_URL }}
+      POLYMARKET_WS_URL: ${{ vars.POLYMARKET_WS_URL || 'wss://ws-subscriptions-clob.polymarket.com/ws/market' }}
+      KALSHI_WS_URL: ${{ vars.KALSHI_WS_URL || 'wss://api.elections.kalshi.com/trade-api/ws/v2' }}
+      ODDSPAPI_WS_URL: ${{ vars.ODDSPAPI_WS_URL || 'wss://api.oddspapi.io/v4/ws' }}
       ODDSPAPI_BASE_URL: ${{ vars.ODDSPAPI_BASE_URL }}
       ODDSPAPI_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_TOURNAMENT_IDS }}
       ODDSPAPI_TOURNAMENT_NAME: ${{ vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
@@ -86,6 +86,13 @@ jobs:
           done
           if [ -z "$ODDSPAPI_KEY" ]; then
             echo "::warning title=Missing OddsPapi key::ODDSPAPI_KEY was not injected. The bot will run, but Pinnacle and 1xBet coverage from OddsPapi will be skipped until the secret name/value is fixed."
+          else
+            echo "OddsPapi key injected: yes"
+          fi
+          if [ -z "$KALSHI_BEARER_TOKEN" ] && [ -z "$KALSHI_API_KEY" ] && [ -z "$KALSHI_ACCESS_KEY" ]; then
+            echo "::warning title=Missing Kalshi auth::Kalshi WebSocket auth is not configured. Kalshi live order books will be skipped."
+          else
+            echo "Kalshi auth injected: yes"
           fi
           exit "$missing"
 
