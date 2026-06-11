@@ -1226,12 +1226,23 @@ def oddspapi_api_key() -> str | None:
         "ODDSPAPI_KEY",
         "ODDSPAPI_API_KEY",
         "ODDSPAPI_TOKEN",
+        "ODDSPAPI",
+        "OODSPAPI_KEY",
+        "OODSPAPI_API_KEY",
+        "ODDPAPI_KEY",
         "ODDS_PAPI_KEY",
+        "ODDS_PAPI_API_KEY",
         "ODDS_PAPI_TOKEN",
         "ODDS_API_KEY",
+        "ODDSAPI_KEY",
         "THE_ODDS_API_KEY",
         "oddspapi_key",
         "oddspapi_api_key",
+        "oddspapi",
+        "oodspapi_key",
+        "oddpapi_key",
+        "odds_papi_key",
+        "oddsapi_key",
     )
     for alias in aliases:
         value = os.environ.get(alias)
