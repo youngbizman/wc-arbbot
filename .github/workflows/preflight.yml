@@ -12,8 +12,12 @@ jobs:
     timeout-minutes: 15
     env:
       LOG_LEVEL: INFO
-      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
-      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
+      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY }}
+      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_API_KEY }}
+      ODDS_PAPI_KEY: ${{ secrets.ODDS_PAPI_KEY }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      ODDSPAPI_KEY_VAR: ${{ vars.ODDSPAPI_KEY }}
+      ODDSPAPI_API_KEY_VAR: ${{ vars.ODDSPAPI_API_KEY }}
       TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       POLYMARKET_DISCOVERY_JSON: seed/polymarket_world_cup.json
@@ -26,6 +30,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Normalize OddsPapi key
+        shell: bash
+        run: |
+          canonical="${ODDSPAPI_KEY:-${ODDSPAPI_API_KEY:-${ODDS_PAPI_KEY:-${ODDS_API_KEY:-${ODDSPAPI_KEY_VAR:-$ODDSPAPI_API_KEY_VAR}}}}}"
+          {
+            echo "ODDSPAPI_KEY=$canonical"
+            echo "ODDSPAPI_API_KEY=$canonical"
+          } >> "$GITHUB_ENV"
 
       - name: Secret diagnostics
         shell: bash

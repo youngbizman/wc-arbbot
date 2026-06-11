@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import datetime as dt
 import html
 import json
 import logging
@@ -112,48 +113,51 @@ def format_arbitrage_alert(opportunity: Any) -> str:
 
     event_name = str(data.get("event_name") or data.get("eventName") or "Unknown event")
     market_name = str(data.get("market_name") or data.get("marketName") or "Overlapping market")
+    event_time = data.get("event_time") or data.get("eventTime")
+    market_type = str(data.get("market_type") or data.get("marketType") or "")
+    line = float_or_none(data.get("line"))
     profit_pct = float_or_none(data.get("profit_pct") or data.get("profitPct")) or 0.0
     total_cost = float_or_none(data.get("total_cost") or data.get("totalCost")) or 0.0
     profit = float_or_none(data.get("profit")) or 0.0
     payout = float_or_none(data.get("target_payout") or data.get("targetPayout")) or 0.0
-    cluster_id = str(data.get("canonical_id") or data.get("canonicalId") or "")
+    market_label = format_market_label(market_type, market_name, line)
 
     lines = [
         "<b>+EV Arbitrage Signal</b>",
         "",
-        f"<b>Event:</b> {html_escape(event_name)}",
-        f"<b>Market:</b> {html_escape(market_name)}",
-        f"<b>Edge:</b> <code>{html_escape(format_pct(profit_pct))}</code>",
-        f"<b>Target payout:</b> <code>{html_escape(format_money(payout))}</code>",
-        f"<b>Total stake:</b> <code>{html_escape(format_money(total_cost))}</code>",
-        f"<b>Guaranteed profit:</b> <code>{html_escape(format_money(profit))}</code>",
+        f"<b>Game:</b> {html_escape(event_name)}",
+        f"<b>Date:</b> {html_escape(format_event_time(event_time))}",
+        f"<b>Market:</b> {html_escape(market_label)}",
+        "",
+        f"<b>ROI:</b> <code>{html_escape(format_pct(profit_pct))}</code>",
+        f"<b>Total investment:</b> <code>{html_escape(format_money(total_cost))}</code>",
+        f"<b>Total outcome:</b> <code>{html_escape(format_money(payout))}</code>",
+        f"<b>Net profit:</b> <code>{html_escape(format_money(profit))}</code>",
     ]
-    if cluster_id:
-        lines.append(f"<b>Cluster:</b> <code>{html_escape(cluster_id)}</code>")
-    lines.extend(["", "<b>Required legs:</b>"])
+    lines.extend(["", "<b>Manual legs:</b>"])
 
     for index, leg in enumerate(legs, start=1):
-        platform = str(leg.get("platform") or "unknown").title()
+        platform = platform_label(str(leg.get("platform") or "unknown"))
         outcome = str(leg.get("outcome_key") or leg.get("outcome") or "outcome")
         url = str(leg.get("url") or "")
         stake = float_or_none(leg.get("stake") or leg.get("cost")) or 0.0
         vwap = float_or_none(leg.get("vwap") or leg.get("effective_probability"))
         odds = float_or_none(leg.get("effective_odds"))
-        instrument = str(leg.get("instrument_id") or leg.get("instrumentId") or "")
         market = str(leg.get("market_name") or leg.get("marketName") or "")
 
         platform_text = html_link(platform, url) if url else html_escape(platform)
         lines.append("")
-        lines.append(f"{index}. <b>{platform_text}</b> - <code>{html_escape(outcome)}</code>")
+        lines.append(
+            f"{index}. On <b>{platform_text}</b> put "
+            f"<code>{html_escape(format_money(stake))}</code> on "
+            f"<b>{html_escape(human_outcome(outcome, market))}</b>"
+        )
         if market:
             lines.append(f"   <b>Book market:</b> {html_escape(market)}")
-        if instrument:
-            lines.append(f"   <b>Instrument:</b> <code>{html_escape(short_id(instrument))}</code>")
         if vwap is not None:
             lines.append(f"   <b>VWAP price:</b> <code>{html_escape(format_price(vwap))}</code>")
         if odds is not None:
             lines.append(f"   <b>Effective odds:</b> <code>{html_escape(format_price(odds))}x</code>")
-        lines.append(f"   <b>Stake:</b> <code>{html_escape(format_money(stake))}</code>")
 
     stale = data.get("max_data_age_seconds") or data.get("maxDataAgeSeconds")
     if stale is not None:
@@ -199,6 +203,67 @@ def strip_markup(value: str) -> str:
     value = re.sub(r"<a\s+href=\"([^\"]+)\">([^<]+)</a>", r"\2 (\1)", value)
     value = re.sub(r"</?(?:b|i|code)>", "", value)
     return html.unescape(value)
+
+
+def platform_label(value: str) -> str:
+    labels = {
+        "1xbet": "1xBet",
+        "azuro": "Azuro",
+        "dexsport": "Dexsport",
+        "kalshi": "Kalshi",
+        "oddspapi": "OddsPapi",
+        "pinnacle": "Pinnacle",
+        "polymarket": "Polymarket",
+    }
+    return labels.get(value.strip().lower(), value.strip().title() or "Unknown")
+
+
+def format_market_label(market_type: str, market_name: str, line: float | None) -> str:
+    labels = {
+        "moneyline": "Moneyline",
+        "draw_no_bet": "Draw no bet",
+        "exact_score": "Exact score",
+        "both_teams_to_score": "Both teams to score",
+        "total_goals": "Game total",
+        "team_total_goals": "Team total",
+        "handicap": "Handicap",
+        "halftime_result": "Halftime result",
+        "first_half": "First half",
+        "player_goal": "Player prop",
+        "first_goalscorer": "First goalscorer",
+        "golden_boot": "Golden boot",
+        "outright_winner": "Outright winner",
+        "group_winner": "Group winner",
+        "stage_of_elimination": "Stage of elimination",
+    }
+    clean_type = labels.get(market_type.strip().lower(), market_type.replace("_", " ").title())
+    if line is not None and clean_type:
+        return f"{clean_type} {line:g}"
+    if clean_type:
+        return clean_type
+    return market_name or "Overlapping market"
+
+
+def format_event_time(value: Any) -> str:
+    if not value:
+        return "Unknown"
+    raw = str(value)
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def human_outcome(outcome: str, market_name: str) -> str:
+    clean = outcome.replace("_", " ").strip()
+    if clean.lower() in {"yes", "no", "over", "under", "home", "away", "draw"}:
+        return clean.upper()
+    if clean:
+        return clean.title()
+    return market_name or "selection"
 
 
 def format_money(value: float) -> str:

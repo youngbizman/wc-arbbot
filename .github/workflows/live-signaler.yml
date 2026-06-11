@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       target_payout_usd:
-        description: "Equalized payout target per outcome in USD"
+        description: "Gross payout target per outcome in USD"
         required: true
-        default: "500"
+        default: "1000"
       min_profit_pct:
         description: "Minimum net arbitrage edge percentage"
         required: true
-        default: "1.5"
+        default: "0.5"
       discovery_platforms:
         description: "Platforms to discover during the indexer stage"
         required: true
@@ -19,6 +19,30 @@ on:
         description: "Live WebSocket listener platforms"
         required: true
         default: "polymarket,kalshi,oddspapi"
+      oddspapi_bookmakers:
+        description: "Bookmakers to include inside OddsPapi"
+        required: true
+        default: "pinnacle,1xbet"
+      min_platforms:
+        description: "Minimum distinct platforms required per alert"
+        required: true
+        default: "2"
+      max_alerts_per_digest:
+        description: "Maximum Telegram alerts per digest window"
+        required: true
+        default: "2"
+      alert_digest_seconds:
+        description: "Seconds between top-opportunity Telegram digests"
+        required: true
+        default: "60"
+      alert_cooldown_seconds:
+        description: "Seconds before the same leg combination can alert again"
+        required: true
+        default: "600"
+      max_runtime_minutes:
+        description: "Stop the live signaler cleanly after this many minutes"
+        required: true
+        default: "60"
       dry_run:
         description: "Log alerts without sending Telegram messages"
         required: true
@@ -37,8 +61,12 @@ jobs:
     timeout-minutes: 355
     env:
       LOG_LEVEL: INFO
-      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
-      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
+      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY }}
+      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_API_KEY }}
+      ODDS_PAPI_KEY: ${{ secrets.ODDS_PAPI_KEY }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      ODDSPAPI_KEY_VAR: ${{ vars.ODDSPAPI_KEY }}
+      ODDSPAPI_API_KEY_VAR: ${{ vars.ODDSPAPI_API_KEY }}
       TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
@@ -53,20 +81,33 @@ jobs:
       ODDSPAPI_BASE_URL: ${{ vars.ODDSPAPI_BASE_URL }}
       ODDSPAPI_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_TOURNAMENT_IDS }}
       ODDSPAPI_TOURNAMENT_NAME: ${{ vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
-      ODDSPAPI_BOOKMAKERS: ${{ vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
+      ODDSPAPI_BOOKMAKERS: ${{ inputs.oddspapi_bookmakers || vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
       POLYMARKET_DISCOVERY_JSON: /app/seed/polymarket_world_cup.json
       KALSHI_DISCOVERY_JSON: /app/seed/kalshi_world_cup.json
       WC_ARBBOT_WINDOW_HOURS: ${{ vars.WC_ARBBOT_WINDOW_HOURS || '48' }}
       WC_ARBBOT_PLATFORMS: ${{ inputs.discovery_platforms || vars.WC_ARBBOT_PLATFORMS || 'polymarket,kalshi,oddspapi' }}
       SIGNALER_PLATFORMS: ${{ inputs.listener_platforms || vars.SIGNALER_PLATFORMS || 'polymarket,kalshi,oddspapi' }}
-      SIGNAL_TARGET_PAYOUT_USD: ${{ inputs.target_payout_usd || vars.SIGNAL_TARGET_PAYOUT_USD || '500' }}
-      SIGNAL_MIN_PROFIT_PCT: ${{ inputs.min_profit_pct || vars.SIGNAL_MIN_PROFIT_PCT || '1.5' }}
+      SIGNAL_TARGET_PAYOUT_USD: ${{ inputs.target_payout_usd || vars.SIGNAL_TARGET_PAYOUT_USD || '1000' }}
+      SIGNAL_MIN_PROFIT_PCT: ${{ inputs.min_profit_pct || vars.SIGNAL_MIN_PROFIT_PCT || '0.5' }}
+      SIGNAL_MIN_PLATFORMS: ${{ inputs.min_platforms || vars.SIGNAL_MIN_PLATFORMS || '2' }}
+      SIGNAL_MAX_ALERTS_PER_DIGEST: ${{ inputs.max_alerts_per_digest || vars.SIGNAL_MAX_ALERTS_PER_DIGEST || '2' }}
+      SIGNAL_ALERT_DIGEST_SECONDS: ${{ inputs.alert_digest_seconds || vars.SIGNAL_ALERT_DIGEST_SECONDS || '60' }}
+      SIGNAL_ALERT_COOLDOWN_SECONDS: ${{ inputs.alert_cooldown_seconds || vars.SIGNAL_ALERT_COOLDOWN_SECONDS || '600' }}
       SIGNAL_DRY_RUN: ${{ inputs.dry_run || vars.SIGNAL_DRY_RUN || 'false' }}
       SIGNAL_ALLOW_EMPTY_TAXONOMY: "false"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Normalize OddsPapi key
+        shell: bash
+        run: |
+          canonical="${ODDSPAPI_KEY:-${ODDSPAPI_API_KEY:-${ODDS_PAPI_KEY:-${ODDS_API_KEY:-${ODDSPAPI_KEY_VAR:-$ODDSPAPI_API_KEY_VAR}}}}}"
+          {
+            echo "ODDSPAPI_KEY=$canonical"
+            echo "ODDSPAPI_API_KEY=$canonical"
+          } >> "$GITHUB_ENV"
 
       - name: Validate required secrets
         shell: bash
@@ -94,8 +135,11 @@ jobs:
         run: docker build -t wc-arbbot:latest .
 
       - name: Run live signaler
+        env:
+          MAX_RUNTIME_MINUTES: ${{ inputs.max_runtime_minutes || vars.SIGNAL_MAX_RUNTIME_MINUTES || '60' }}
         run: |
-          docker run --rm \
+          set +e
+          timeout "${MAX_RUNTIME_MINUTES}m" docker run --rm \
             --name wc-arbbot-live \
             -e LOG_LEVEL \
             -e ODDSPAPI_KEY \
@@ -122,6 +166,16 @@ jobs:
             -e SIGNALER_PLATFORMS \
             -e SIGNAL_TARGET_PAYOUT_USD \
             -e SIGNAL_MIN_PROFIT_PCT \
+            -e SIGNAL_MIN_PLATFORMS \
+            -e SIGNAL_MAX_ALERTS_PER_DIGEST \
+            -e SIGNAL_ALERT_DIGEST_SECONDS \
+            -e SIGNAL_ALERT_COOLDOWN_SECONDS \
             -e SIGNAL_DRY_RUN \
             -e SIGNAL_ALLOW_EMPTY_TAXONOMY \
             wc-arbbot:latest
+          status=$?
+          if [ "$status" -eq 124 ]; then
+            echo "Live signaler reached ${MAX_RUNTIME_MINUTES} minute runtime window; exiting cleanly."
+            exit 0
+          fi
+          exit "$status"

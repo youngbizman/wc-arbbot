@@ -55,6 +55,9 @@ class SignalerConfig:
     dry_run: bool = False
     assume_multigroup_exhaustive: bool = False
     min_multi_outcomes: int = 3
+    min_platforms: int = 2
+    max_alerts_per_digest: int = 2
+    alert_digest_seconds: float = 60.0
 
     @classmethod
     def from_env(cls, taxonomy_path: str | None = None) -> "SignalerConfig":
@@ -94,6 +97,15 @@ class SignalerConfig:
                 cls.assume_multigroup_exhaustive,
             ),
             min_multi_outcomes=int_env("SIGNAL_MIN_MULTI_OUTCOMES", cls.min_multi_outcomes),
+            min_platforms=int_env("SIGNAL_MIN_PLATFORMS", cls.min_platforms),
+            max_alerts_per_digest=int_env(
+                "SIGNAL_MAX_ALERTS_PER_DIGEST",
+                cls.max_alerts_per_digest,
+            ),
+            alert_digest_seconds=float_env(
+                "SIGNAL_ALERT_DIGEST_SECONDS",
+                cls.alert_digest_seconds,
+            ),
         )
 
 
@@ -107,6 +119,9 @@ class InstrumentRef:
     instrument_id: str
     event_name: str
     market_name: str
+    event_time: str | None = None
+    market_type: str | None = None
+    line: float | None = None
     url: str | None = None
     limit: float | None = None
 
@@ -153,6 +168,9 @@ class AlertLeg:
     instrument_id: str
     event_name: str
     market_name: str
+    event_time: str | None
+    market_type: str | None
+    line: float | None
     url: str | None
     stake: float
     vwap: float
@@ -165,6 +183,9 @@ class ArbitrageOpportunity:
     canonical_id: str
     event_name: str
     market_name: str
+    event_time: str | None
+    market_type: str | None
+    line: float | None
     target_payout: float
     total_cost: float
     profit: float
@@ -278,6 +299,30 @@ class TaxonomyStore:
                 if platform == "kalshi":
                     side = outcome_key if outcome_key in {"yes", "no"} else outcome_id.lower()
                     instrument_id = f"{source.get('market_id') or market.get('market_id')}:{side}"
+                event_time = first_non_empty(
+                    str(value)
+                    for value in (
+                        source.get("start_time"),
+                        source.get("startTime"),
+                        market.get("start_time"),
+                        market.get("startTime"),
+                        source.get("resolve_time"),
+                        source.get("resolveTime"),
+                        market.get("resolve_time"),
+                        market.get("resolveTime"),
+                    )
+                    if value
+                )
+                market_type = first_non_empty(
+                    str(value)
+                    for value in (
+                        market.get("market_type"),
+                        market.get("marketType"),
+                        source.get("market_type"),
+                        source.get("marketType"),
+                    )
+                    if value
+                )
                 ref = InstrumentRef(
                     platform=platform,
                     canonical_id=canonical_id,
@@ -287,6 +332,9 @@ class TaxonomyStore:
                     instrument_id=instrument_id,
                     event_name=str(source.get("event_name") or market.get("event_name") or ""),
                     market_name=str(source.get("market_name") or market.get("market_name") or ""),
+                    event_time=event_time,
+                    market_type=market_type,
+                    line=float_or_none(market.get("line") or source.get("line")),
                     url=source.get("url") or source.get("link"),
                     limit=float_or_none(outcome.get("limit") or source.get("limit")),
                 )
@@ -348,6 +396,7 @@ class SignalEngine:
         self.taxonomy = taxonomy
         self.telegram = telegram
         self.quotes: dict[str, LiveQuote] = {}
+        self.pending_opportunities: dict[str, ArbitrageOpportunity] = {}
         self.last_alert_at: dict[str, float] = {}
         self.lock = asyncio.Lock()
 
@@ -405,7 +454,7 @@ class SignalEngine:
         for canonical_id in canonical_ids:
             opportunity = self.evaluate_cluster(canonical_id)
             if opportunity:
-                await self.alert(opportunity)
+                self.queue_opportunity(opportunity)
 
     def evaluate_cluster(self, canonical_id: str) -> ArbitrageOpportunity | None:
         now = time.time()
@@ -424,6 +473,7 @@ class SignalEngine:
 
         outcome_keys = choose_covering_outcomes(
             grouped.keys(),
+            market_type=first_non_empty(quote.ref.market_type or "" for quote in quotes),
             assume_multigroup_exhaustive=self.config.assume_multigroup_exhaustive,
             min_multi_outcomes=self.config.min_multi_outcomes,
         )
@@ -447,6 +497,9 @@ class SignalEngine:
                 return None
             best_legs.append(best)
 
+        if len({quote.ref.platform for quote, _, _ in best_legs}) < self.config.min_platforms:
+            return None
+
         total_cost = sum(cost for _, cost, _ in best_legs)
         profit = payout - total_cost
         if total_cost <= 0 or profit <= 0:
@@ -467,6 +520,9 @@ class SignalEngine:
                 instrument_id=quote.ref.instrument_id,
                 event_name=quote.ref.event_name,
                 market_name=quote.ref.market_name,
+                event_time=quote.ref.event_time,
+                market_type=quote.ref.market_type,
+                line=quote.ref.line,
                 url=quote.ref.url,
                 stake=cost,
                 vwap=probability,
@@ -477,10 +533,16 @@ class SignalEngine:
         )
         event_name = first_non_empty(leg.event_name for leg in legs) or canonical_id
         market_name = first_non_empty(leg.market_name for leg in legs) or canonical_id
+        event_time = first_non_empty(leg.event_time or "" for leg in legs)
+        market_type = first_non_empty(leg.market_type or "" for leg in legs)
+        line = first_non_null(leg.line for leg in legs)
         return ArbitrageOpportunity(
             canonical_id=canonical_id,
             event_name=event_name,
             market_name=market_name,
+            event_time=event_time,
+            market_type=market_type,
+            line=line,
             target_payout=payout,
             total_cost=total_cost,
             profit=profit,
@@ -488,6 +550,58 @@ class SignalEngine:
             max_data_age_seconds=max(now - leg.updated_at for leg in legs),
             legs=legs,
         )
+
+    def queue_opportunity(self, opportunity: ArbitrageOpportunity) -> None:
+        key = self.alert_key(
+            opportunity.canonical_id,
+            tuple((leg, leg.stake, leg.vwap) for leg in opportunity.legs),  # type: ignore[arg-type]
+            opportunity.profit_pct,
+        )
+        now = time.time()
+        last_alert = self.last_alert_at.get(key)
+        if last_alert and now - last_alert < self.config.alert_cooldown_seconds:
+            return
+        current = self.pending_opportunities.get(key)
+        if (
+            current is None
+            or opportunity_latest_update(opportunity) >= opportunity_latest_update(current)
+            or (opportunity.profit, opportunity.profit_pct) > (current.profit, current.profit_pct)
+        ):
+            self.pending_opportunities[key] = opportunity
+
+    async def run_digest_loop(self) -> None:
+        LOGGER.info(
+            "Alert digest enabled: sending top %s by net profit every %.1fs",
+            self.config.max_alerts_per_digest,
+            self.config.alert_digest_seconds,
+        )
+        while True:
+            await asyncio.sleep(max(1.0, self.config.alert_digest_seconds))
+            await self.flush_alert_digest()
+
+    async def flush_alert_digest(self) -> None:
+        async with self.lock:
+            if not self.pending_opportunities:
+                return
+            opportunities = list(self.pending_opportunities.values())
+            self.pending_opportunities.clear()
+        limit = max(0, self.config.max_alerts_per_digest)
+        if limit == 0:
+            LOGGER.info("Discarded %s pending opportunities because max alerts is 0", len(opportunities))
+            return
+        selected = sorted(
+            opportunities,
+            key=lambda opportunity: (opportunity.profit, opportunity.profit_pct),
+            reverse=True,
+        )[:limit]
+        LOGGER.warning(
+            "Alert digest sending %s/%s opportunities; best net profit %s",
+            len(selected),
+            len(opportunities),
+            f"${selected[0].profit:,.2f}" if selected else "$0.00",
+        )
+        for opportunity in selected:
+            await self.alert(opportunity)
 
     async def alert(self, opportunity: ArbitrageOpportunity) -> None:
         alert_key = self.alert_key(
@@ -515,12 +629,9 @@ class SignalEngine:
             {
                 "canonical_id": canonical_id,
                 "legs": [
-                    getattr(item[0], "ref", item[0]).instrument_id
-                    if isinstance(item, tuple)
-                    else getattr(item, "instrument_id", "")
+                    stable_leg_id(item)
                     for item in legs
                 ],
-                "bucket": round(profit_pct, 1),
             },
             sort_keys=True,
         )
@@ -816,6 +927,9 @@ class OddsPapiListener(ReconnectingListener):
         self.api_key = os.environ.get("ODDSPAPI_KEY") or os.environ.get("ODDSPAPI_API_KEY")
         base = env_str("ODDSPAPI_WS_URL", "wss://api.oddspapi.io/v4/ws")
         self.url = f"{base}?apiKey={quote(self.api_key or '')}"
+        self.bookmakers = {book.lower() for book in env_csv("ODDSPAPI_BOOKMAKERS")}
+        if not self.bookmakers:
+            self.bookmakers = {"pinnacle", "1xbet"}
 
     async def run_once(self) -> None:
         if not self.api_key:
@@ -833,7 +947,7 @@ class OddsPapiListener(ReconnectingListener):
         bookmaker_odds = as_mapping(message.get("bookmakerOdds"))
         for bookmaker, book_payload_raw in bookmaker_odds.items():
             book = str(bookmaker).lower()
-            if book not in {"pinnacle", "1xbet"}:
+            if "all" not in self.bookmakers and book not in self.bookmakers:
                 continue
             book_payload = as_mapping(book_payload_raw)
             markets = as_mapping(book_payload.get("markets"))
@@ -936,16 +1050,25 @@ class LiveSignaler:
             len(listeners),
             len(self.taxonomy.clusters),
         )
-        await asyncio.gather(*(listener.run_forever() for listener in listeners))
+        await asyncio.gather(
+            self.engine.run_digest_loop(),
+            *(listener.run_forever() for listener in listeners),
+        )
 
 
 def choose_covering_outcomes(
     keys: Iterable[str],
     *,
+    market_type: str | None = None,
     assume_multigroup_exhaustive: bool,
     min_multi_outcomes: int,
 ) -> tuple[str, ...]:
     key_set = {normalize_outcome_key(key) for key in keys if key}
+    if market_type == "moneyline":
+        if "draw" in key_set and len(key_set) >= 3:
+            return tuple(sorted(key_set))
+        if len(key_set) == 2:
+            return tuple(sorted(key_set))
     binary_pairs = [
         ("yes", "no"),
         ("over", "under"),
@@ -1103,6 +1226,33 @@ def first_non_empty(values: Iterable[str]) -> str | None:
         if value:
             return value
     return None
+
+
+def first_non_null(values: Iterable[Any]) -> Any | None:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def stable_leg_id(item: Any) -> str:
+    leg = item[0] if isinstance(item, tuple) and item else item
+    ref = getattr(leg, "ref", None)
+    if ref is not None:
+        return f"{ref.platform}:{ref.market_id}:{ref.instrument_id}:{ref.outcome_key}"
+    return ":".join(
+        str(part)
+        for part in (
+            getattr(leg, "platform", ""),
+            getattr(leg, "instrument_id", ""),
+            getattr(leg, "outcome_key", ""),
+        )
+        if part
+    )
+
+
+def opportunity_latest_update(opportunity: ArbitrageOpportunity) -> float:
+    return max((leg.updated_at for leg in opportunity.legs), default=0.0)
 
 
 def float_or_none(value: Any) -> float | None:

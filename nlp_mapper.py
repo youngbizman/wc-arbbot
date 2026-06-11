@@ -218,6 +218,7 @@ class NormalizedMarket:
             self.period,
             ",".join(self.participants),
             "" if self.line is None else f"{self.line:g}",
+            market_selection_key(self),
             self.start_time[:10] if self.start_time else "",
             self.resolve_time[:10] if self.resolve_time else "",
         ]
@@ -545,15 +546,26 @@ class MarketMapper:
         line_score = line_similarity(left.line, right.line)
         time_score = time_similarity(left.start_time, right.start_time, self.config.max_time_delta_minutes)
         outcome_score = outcome_similarity(left.outcomes, right.outcomes)
+        selection_score = selection_similarity(left, right)
+        if selection_score == 0.0:
+            return MatchCandidate(
+                left_id=left_id,
+                right_id=right_id,
+                left_platform=left.platform,
+                right_platform=right.platform,
+                score=0.0,
+                reasons={"selection": selection_score, "qgram": qgram_score},
+            )
         semantic = semantic_score if semantic_score is not None else 0.0
 
         score = (
             0.20 * participant_score
-            + 0.19 * market_type_score
+            + 0.16 * market_type_score
             + 0.12 * period_score
             + 0.12 * line_score
             + 0.10 * time_score
             + 0.10 * outcome_score
+            + 0.03 * selection_score
             + 0.09 * token_score
             + 0.08 * sequence_score
             + self.config.semantic_weight * semantic
@@ -567,6 +579,7 @@ class MarketMapper:
             "line": line_score,
             "time": time_score,
             "outcome": outcome_score,
+            "selection": selection_score,
             "token": token_score,
             "sequence": sequence_score,
             "qgram": qgram_score,
@@ -605,6 +618,7 @@ class MarketMapper:
                     exemplar.period,
                     ",".join(exemplar.participants),
                     "" if exemplar.line is None else f"{exemplar.line:g}",
+                    market_selection_key(exemplar),
                 ]
             )
         )
@@ -792,14 +806,78 @@ def candidate_blocks(market: NormalizedMarket) -> set[str]:
     date_bucket = (market.start_time or market.resolve_time or "")[:10]
     participant_key = ",".join(market.participants)
     line_key = "" if market.line is None else f"{market.line:g}"
-    blocks.add(f"{date_bucket}|{market.event_scope}|{participant_key}|{market.market_type}|{market.period}|{line_key}")
-    blocks.add(f"{date_bucket}|{participant_key}|{market.market_type}|{market.period}")
-    blocks.add(f"{market.event_scope}|{participant_key}|{market.market_type}")
+    selection_key = market_selection_key(market)
+    blocks.add(
+        f"{date_bucket}|{market.event_scope}|{participant_key}|"
+        f"{market.market_type}|{market.period}|{line_key}|{selection_key}"
+    )
+    blocks.add(f"{date_bucket}|{participant_key}|{market.market_type}|{market.period}|{selection_key}")
+    blocks.add(f"{market.event_scope}|{participant_key}|{market.market_type}|{selection_key}")
     if market.mutually_exclusive_group_id:
         blocks.add(f"group:{market.platform}:{market.mutually_exclusive_group_id}")
     if participant_key:
         blocks.add(f"participants:{participant_key}:{market.market_type}")
+    if selection_key:
+        blocks.add(f"selection:{participant_key}:{market.market_type}:{selection_key}")
     return {block for block in blocks if block.replace("|", "").strip()}
+
+
+def market_selection_key(market: NormalizedMarket) -> str:
+    scores = sorted({outcome.score for outcome in market.outcomes if outcome.score is not None})
+    if market.market_type == "exact_score" and scores:
+        return "score:" + ",".join(f"{home}-{away}" for home, away in scores)
+
+    subject = selection_subject(market)
+    line_key = "" if market.line is None else f":line:{market.line:g}"
+    if market.market_type in {"team_total_goals", "handicap"} and subject:
+        return f"{market.market_type}:{subject}{line_key}"
+    if market.market_type in {"player_goal", "first_goalscorer"} and subject:
+        threshold = player_threshold(market.market_name)
+        threshold_key = f":threshold:{threshold}" if threshold else ""
+        return f"{market.market_type}:{subject}{line_key}{threshold_key}"
+    return ""
+
+
+def selection_similarity(left: NormalizedMarket, right: NormalizedMarket) -> float:
+    left_key = market_selection_key(left)
+    right_key = market_selection_key(right)
+    if not left_key and not right_key:
+        return 1.0
+    if not left_key or not right_key:
+        return 0.6
+    return 1.0 if left_key == right_key else 0.0
+
+
+def selection_subject(market: NormalizedMarket) -> str:
+    for outcome in market.outcomes:
+        if outcome.participant:
+            return outcome.participant
+    participant = first_participant(market.market_name)
+    if participant:
+        return participant
+    head = re.split(r"[:|?]", market.market_name, maxsplit=1)[0]
+    head = re.split(r"\bto score\b|\bover\b|\bunder\b|\bwill\b", head, maxsplit=1, flags=re.IGNORECASE)[0]
+    norm = normalize_text(head).normalized
+    stopwords = {
+        "anytime",
+        "first",
+        "goal",
+        "goals",
+        "goalscorer",
+        "player",
+        "score",
+        "team",
+        "total",
+        "will",
+        "win",
+    }
+    tokens = [token for token in norm.split() if token not in stopwords and not token.isdigit()]
+    return "-".join(tokens[:6])
+
+
+def player_threshold(text: str) -> str:
+    match = re.search(r"\b(\d+)\s*\+\s*(?:goal|goals|shots|assists)?\b", text, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
 
 
 def hard_entity_overlap(left: NormalizedMarket, right: NormalizedMarket) -> bool:
