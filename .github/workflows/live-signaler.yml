@@ -109,6 +109,7 @@ jobs:
       ODDSPAPI_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_TOURNAMENT_IDS }}
       ODDSPAPI_TOURNAMENT_NAME: ${{ vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
       ODDSPAPI_BOOKMAKERS: ${{ inputs.oddspapi_bookmakers || vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
+      ODDSPAPI_LIVE_MODE: ${{ vars.ODDSPAPI_LIVE_MODE || 'poll' }}
       POLYMARKET_DISCOVERY_JSON: /app/seed/polymarket_world_cup.json
       KALSHI_DISCOVERY_JSON: /app/seed/kalshi_world_cup.json
       WC_ARBBOT_WINDOW_HOURS: ${{ vars.WC_ARBBOT_WINDOW_HOURS || '48' }}
@@ -247,6 +248,7 @@ jobs:
             -e ODDSPAPI_TOURNAMENT_IDS \
             -e ODDSPAPI_TOURNAMENT_NAME \
             -e ODDSPAPI_BOOKMAKERS \
+            -e ODDSPAPI_LIVE_MODE \
             -e POLYMARKET_DISCOVERY_JSON \
             -e KALSHI_DISCOVERY_JSON \
             -e WC_ARBBOT_WINDOW_HOURS \

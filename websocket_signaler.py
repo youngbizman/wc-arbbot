@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import random
+import re
 import ssl
 import time
 from collections import defaultdict
@@ -28,9 +29,12 @@ from urllib.parse import quote
 
 from indexer import (
     AsyncHTTPClient,
+    IndexerConfig,
     OrderBook,
     OrderBookLevel,
+    OddsPapiIndexer,
     Platform,
+    TimeWindow,
     kalshi_headers,
     oddspapi_api_key,
     parse_kalshi_side,
@@ -299,6 +303,24 @@ class TaxonomyStore:
                     or outcome.get("name")
                     or outcome_id
                 )
+                market_type_for_ref = first_non_empty(
+                    str(value)
+                    for value in (
+                        market.get("market_type"),
+                        market.get("marketType"),
+                        source.get("market_type"),
+                        source.get("marketType"),
+                    )
+                    if value
+                )
+                if market_type_for_ref == "moneyline" and outcome_key in {"yes", "no"}:
+                    if outcome_key == "no":
+                        continue
+                    selection_key = moneyline_selection_from_market(
+                        str(source.get("market_name") or market.get("market_name") or "")
+                    )
+                    if selection_key:
+                        outcome_key = selection_key
                 instrument_id = str(
                     outcome.get("token_id")
                     or outcome.get("tokenId")
@@ -323,16 +345,6 @@ class TaxonomyStore:
                     )
                     if value
                 )
-                market_type = first_non_empty(
-                    str(value)
-                    for value in (
-                        market.get("market_type"),
-                        market.get("marketType"),
-                        source.get("market_type"),
-                        source.get("marketType"),
-                    )
-                    if value
-                )
                 ref = InstrumentRef(
                     platform=platform,
                     canonical_id=canonical_id,
@@ -343,7 +355,7 @@ class TaxonomyStore:
                     event_name=str(source.get("event_name") or market.get("event_name") or ""),
                     market_name=str(source.get("market_name") or market.get("market_name") or ""),
                     event_time=event_time,
-                    market_type=market_type,
+                    market_type=market_type_for_ref,
                     line=float_or_none(market.get("line") or source.get("line")),
                     url=source.get("url") or source.get("link"),
                     limit=float_or_none(outcome.get("limit") or source.get("limit")),
@@ -393,6 +405,13 @@ class TaxonomyStore:
         for i in range(len(raw), 0, -1):
             aliases.append(":".join(raw[:i]))
         return aliases
+
+    def cross_platform_cluster_count(self) -> int:
+        count = 0
+        for refs in self.refs_by_canonical.values():
+            if len({ref.platform for ref in refs}) > 1:
+                count += 1
+        return count
 
 
 class SignalEngine:
@@ -1097,6 +1116,69 @@ class OddsPapiListener(ReconnectingListener):
         )
 
 
+class OddsPapiRestPollingListener(ReconnectingListener):
+    name = "oddspapi"
+
+    def __init__(self, config: SignalerConfig, engine: SignalEngine) -> None:
+        super().__init__(config, engine)
+        self.api_key = oddspapi_api_key()
+        self.poll_seconds = float_env("ODDSPAPI_REST_POLL_SECONDS", 20.0)
+        self.config_snapshot = IndexerConfig.from_env()
+        self.http = AsyncHTTPClient(
+            timeout_seconds=float_env("ODDSPAPI_REST_TIMEOUT_SECONDS", 20.0),
+            retries=int_env("ODDSPAPI_REST_RETRIES", 2),
+            backoff_seconds=float_env("ODDSPAPI_REST_BACKOFF_SECONDS", 0.5),
+        )
+
+    async def run_once(self) -> None:
+        if not self.api_key:
+            LOGGER.info("Skipping OddsPapi REST polling: no OddsPapi key is set")
+            await asyncio.sleep(3600)
+            return
+        LOGGER.info(
+            "Starting OddsPapi REST polling for bookmakers=%s every %.1fs",
+            ",".join(self.config_snapshot.odds_papi_bookmakers),
+            self.poll_seconds,
+        )
+        while True:
+            await self.poll_once()
+            await asyncio.sleep(max(5.0, self.poll_seconds))
+
+    async def poll_once(self) -> None:
+        window = TimeWindow.next_hours(float_env("WC_ARBBOT_WINDOW_HOURS", self.config_snapshot.window_hours))
+        indexer = OddsPapiIndexer(self.config_snapshot, self.http, window)
+        try:
+            markets = await indexer.fetch_markets()
+        except Exception:
+            LOGGER.exception("OddsPapi REST poll failed")
+            return
+        updates = 0
+        for market in markets:
+            platform = market.platform.value if hasattr(market.platform, "value") else str(market.platform)
+            for outcome in market.outcomes:
+                decimal_odds = outcome.decimal_odds
+                if decimal_odds is None and outcome.probability and outcome.probability > 0:
+                    decimal_odds = 1.0 / outcome.probability
+                if not decimal_odds or decimal_odds <= 1:
+                    continue
+                aliases = [
+                    f"{platform}:{market.market_id}:{outcome.outcome_id}",
+                    f"{platform}:{market.market_id}:{outcome.platform_outcome_id}",
+                    f"{platform}:{market.event_id}:{market.market_type}:{outcome.outcome_id}",
+                    f"{platform}:{market.event_id}:{market.market_type}:{outcome.platform_outcome_id}",
+                    str(outcome.outcome_id or ""),
+                    str(outcome.platform_outcome_id or ""),
+                ]
+                await self.engine.update_fixed_odds(
+                    aliases=[alias for alias in aliases if alias and "None" not in alias],
+                    decimal_odds=decimal_odds,
+                    limit=outcome.limit or market.limit,
+                    payload=market.raw,
+                )
+                updates += 1
+        LOGGER.info("OddsPapi REST poll published %s fixed-odds updates from %s markets", updates, len(markets))
+
+
 class LiveSignaler:
     def __init__(self, config: SignalerConfig) -> None:
         self.config = config
@@ -1126,7 +1208,10 @@ class LiveSignaler:
             listeners.append(AzuroListener(self.config, self.engine, self.taxonomy))
         if "oddspapi" in enabled:
             if oddspapi_api_key():
-                listeners.append(OddsPapiListener(self.config, self.engine))
+                if env_str("ODDSPAPI_LIVE_MODE", "poll").lower() in {"ws", "websocket", "stream"}:
+                    listeners.append(OddsPapiListener(self.config, self.engine))
+                else:
+                    listeners.append(OddsPapiRestPollingListener(self.config, self.engine))
             elif bool_env("SIGNAL_REQUIRE_ODDSPAPI", False):
                 raise RuntimeError("SIGNAL_REQUIRE_ODDSPAPI=true but ODDSPAPI_KEY is not available")
             else:
@@ -1153,13 +1238,17 @@ class LiveSignaler:
 
     async def send_startup_status(self, listeners: Sequence[ReconnectingListener]) -> None:
         names = ", ".join(sorted({listener.name for listener in listeners}))
+        cross_platform_clusters = self.taxonomy.cross_platform_cluster_count()
         message = (
             "wc-arbbot live signaler started\n"
             f"Live sources: {names}\n"
             f"Canonical clusters: {len(self.taxonomy.clusters)}\n"
+            f"Cross-platform clusters: {cross_platform_clusters}\n"
             f"Min platforms per alert: {self.config.min_platforms}\n"
             f"Top alerts per digest: {self.config.max_alerts_per_digest}"
         )
+        if cross_platform_clusters == 0:
+            message += "\nNo cross-platform overlaps were mapped yet; waiting for OddsPapi/Pinnacle/1xBet overlap data."
         if self.config.dry_run or not self.engine.telegram:
             LOGGER.info(message.replace("\n", " | "))
             return
@@ -1209,6 +1298,19 @@ def normalize_outcome_key(value: Any) -> str:
     text = replacements.get(text, text)
     text = text.replace(" ", "_").replace("/", "_")
     return "".join(ch for ch in text if ch.isalnum() or ch in {"_", "-"}).strip("_") or "unknown"
+
+
+def moneyline_selection_from_market(market_name: str) -> str:
+    text = market_name.lower()
+    if "draw" in text:
+        return "draw"
+    match = re.search(r"\bwill\s+(.+?)\s+win\b", text)
+    if not match:
+        match = re.search(r"^(.+?)\s+(?:to\s+)?win\b", text)
+    if not match:
+        return ""
+    selection = re.sub(r"\bon\s+\d{4}-\d{2}-\d{2}\b", "", match.group(1)).strip()
+    return normalize_outcome_key(selection)
 
 
 def parse_price_size_levels(raw: Any) -> list[tuple[float, float]]:

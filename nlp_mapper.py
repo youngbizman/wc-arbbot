@@ -118,6 +118,7 @@ MARKET_ALIASES = {
     "head to head": "moneyline",
     "match winner": "moneyline",
     "money line": "moneyline",
+    "moneyline": "moneyline",
     "1x2": "moneyline",
     "draw no bet": "draw_no_bet",
     "exact score": "exact_score",
@@ -546,6 +547,8 @@ class MarketMapper:
         line_score = line_similarity(left.line, right.line)
         time_score = time_similarity(left.start_time, right.start_time, self.config.max_time_delta_minutes)
         outcome_score = outcome_similarity(left.outcomes, right.outcomes)
+        if left.market_type == right.market_type == "moneyline":
+            outcome_score = max(outcome_score, 0.6)
         selection_score = selection_similarity(left, right)
         if selection_score == 0.0:
             return MatchCandidate(
@@ -707,7 +710,12 @@ def infer_market_type(*parts: str) -> str:
             return canonical
     if re.search(r"\bo\s*/?\s*u\b|\bover\b|\bunder\b", text):
         return "total_goals"
-    if re.search(r"\b[+-]\d+(\.\d+)?\b", text):
+    if re.search(r"\bwill\b.+\bwin\b|\bend in a draw\b|\bdraw at\b", text):
+        return "moneyline"
+    if re.search(r"\b(?:spread|spreads|handicap|line)\b", text) and re.search(
+        r"(?<!\d)[+-]\d+(?:\.\d+)?(?![\d-])",
+        text,
+    ):
         return "handicap"
     return "unknown"
 
@@ -725,8 +733,9 @@ def extract_line(text: str) -> float | None:
     norm = text.lower()
     patterns = [
         r"(?:o/u|over/under|over|under)\s*([0-9]+(?:\.[0-9]+)?)",
+        r"(?:total goals|total|goals)\s*([0-9]+(?:\.[0-9]+)?)",
         r"\(([+-]?[0-9]+(?:\.[0-9]+)?)\)",
-        r"\b([+-][0-9]+(?:\.[0-9]+)?)\b",
+        r"(?<!\d)([+-][0-9]+(?:\.[0-9]+)?)(?![\d-])",
     ]
     for pattern in patterns:
         match = re.search(pattern, norm)
