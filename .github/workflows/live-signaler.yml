@@ -1,9 +1,6 @@
 name: Live Arbitrage Signaler
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       target_payout_usd:
@@ -27,9 +24,6 @@ on:
         required: true
         type: boolean
         default: false
-  schedule:
-    - cron: "0 */6 * * *"
-
 concurrency:
   group: wc-arbbot-live-signaler
   cancel-in-progress: true

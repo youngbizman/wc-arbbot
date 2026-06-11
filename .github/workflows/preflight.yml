@@ -1,0 +1,108 @@
+name: Preflight Diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LOG_LEVEL: INFO
+      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
+      ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_KEY || secrets.ODDSPAPI_API_KEY || secrets.ODDS_PAPI_KEY || secrets.ODDS_API_KEY || vars.ODDSPAPI_KEY || vars.ODDSPAPI_API_KEY }}
+      TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
+      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+      POLYMARKET_DISCOVERY_JSON: seed/polymarket_world_cup.json
+      KALSHI_DISCOVERY_JSON: seed/kalshi_world_cup.json
+      WC_ARBBOT_PLATFORMS: polymarket,kalshi,oddspapi
+      WC_ARBBOT_WINDOW_HOURS: "48"
+      ODDSPAPI_TOURNAMENT_NAME: ${{ vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
+      ODDSPAPI_BOOKMAKERS: ${{ vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Secret diagnostics
+        shell: bash
+        run: |
+          echo "TELEGRAM_BOT_KEY injected: $([ -n "$TELEGRAM_BOT_KEY" ] && echo yes || echo no)"
+          echo "TELEGRAM_GROUP_ID injected: $([ -n "$TELEGRAM_GROUP_ID" ] && echo yes || echo no)"
+          echo "ODDSPAPI_KEY injected: $([ -n "$ODDSPAPI_KEY" ] && echo yes || echo no)"
+          if [ -z "$TELEGRAM_BOT_KEY" ] || [ -z "$TELEGRAM_GROUP_ID" ]; then
+            echo "::error title=Missing Telegram secret::TELEGRAM_BOT_KEY and TELEGRAM_GROUP_ID are required"
+            exit 1
+          fi
+          if [ -z "$ODDSPAPI_KEY" ]; then
+            echo "::warning title=Missing OddsPapi key::No OddsPapi key was injected under ODDSPAPI_KEY, ODDSPAPI_API_KEY, ODDS_PAPI_KEY, ODDS_API_KEY, or matching repository variables."
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile Python
+        run: python -m py_compile indexer.py nlp_mapper.py telegram_bot.py websocket_signaler.py
+
+      - name: Build seeded taxonomy
+        run: |
+          python indexer.py --output markets_preflight.json
+          python nlp_mapper.py --input markets_preflight.json --output taxonomy_preflight.json
+          python - <<'PY'
+          import json
+          with open("markets_preflight.json", "r", encoding="utf-8") as handle:
+              markets = json.load(handle)
+          with open("taxonomy_preflight.json", "r", encoding="utf-8") as handle:
+              taxonomy = json.load(handle)
+          print(f"market_count={len(markets)}")
+          print(f"canonical_cluster_count={len(taxonomy.get('clusters', []))}")
+          if not markets:
+              raise SystemExit("No markets discovered")
+          if not taxonomy.get("clusters"):
+              raise SystemExit("No taxonomy clusters compiled")
+          PY
+
+      - name: Telegram formatting smoke test
+        env:
+          TELEGRAM_PARSE_MODE: HTML
+        run: |
+          cat > alert_smoke.json <<'JSON'
+          {
+            "event_name": "Mexico vs. South Africa - test",
+            "market_name": "Exact Score: Mexico 3 - 1 South Africa?",
+            "profit_pct": 4.17,
+            "target_payout": 500,
+            "total_cost": 480,
+            "profit": 20,
+            "canonical_id": "smoke-test",
+            "max_data_age_seconds": 1.234,
+            "legs": [
+              {
+                "platform": "polymarket",
+                "outcome_key": "yes",
+                "instrument_id": "1234567890abcdef",
+                "market_name": "Exact Score: Mexico 3 - 1 South Africa?",
+                "url": "https://polymarket.com/",
+                "stake": 240,
+                "vwap": 0.48,
+                "effective_odds": 2.083333
+              },
+              {
+                "platform": "polymarket",
+                "outcome_key": "no",
+                "instrument_id": "abcdef1234567890",
+                "market_name": "Exact Score: Mexico 3 - 1 South Africa?",
+                "url": "https://polymarket.com/",
+                "stake": 240,
+                "vwap": 0.48,
+                "effective_odds": 2.083333
+              }
+            ]
+          }
+          JSON
+          python telegram_bot.py --alert-json alert_smoke.json

@@ -13,9 +13,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import html
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,7 +37,7 @@ class TelegramConfig:
     chat_id: str
     api_base_url: str = "https://api.telegram.org"
     timeout_seconds: float = 15.0
-    parse_mode: str = "MarkdownV2"
+    parse_mode: str = "HTML"
     disable_web_page_preview: bool = True
 
     @classmethod
@@ -70,13 +72,17 @@ class TelegramBot:
         return await asyncio.to_thread(self._send_message_sync, text)
 
     def _send_message_sync(self, text: str) -> Mapping[str, Any]:
+        return self._send_payload_sync(text, self.config.parse_mode)
+
+    def _send_payload_sync(self, text: str, parse_mode: str | None) -> Mapping[str, Any]:
         url = f"{self.config.api_base_url.rstrip('/')}/bot{self.config.bot_token}/sendMessage"
         payload = {
             "chat_id": self.config.chat_id,
             "text": text,
-            "parse_mode": self.config.parse_mode,
             "disable_web_page_preview": self.config.disable_web_page_preview,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         body = urllib.parse.urlencode(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -89,6 +95,9 @@ class TelegramBot:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
+            if parse_mode and exc.code == 400 and "can't parse entities" in error_body:
+                LOGGER.warning("Telegram rejected formatted message; retrying as plain text")
+                return self._send_payload_sync(strip_markup(text), None)
             raise RuntimeError(f"Telegram HTTP {exc.code}: {error_body}") from exc
         result = json.loads(raw)
         if not result.get("ok"):
@@ -110,18 +119,18 @@ def format_arbitrage_alert(opportunity: Any) -> str:
     cluster_id = str(data.get("canonical_id") or data.get("canonicalId") or "")
 
     lines = [
-        f"*{md_escape('+EV Arbitrage Signal')}*",
+        "<b>+EV Arbitrage Signal</b>",
         "",
-        f"*Event:* {md_escape(event_name)}",
-        f"*Market:* {md_escape(market_name)}",
-        f"*Edge:* `{md_code(format_pct(profit_pct))}`",
-        f"*Target payout:* `{md_code(format_money(payout))}`",
-        f"*Total stake:* `{md_code(format_money(total_cost))}`",
-        f"*Guaranteed profit:* `{md_code(format_money(profit))}`",
+        f"<b>Event:</b> {html_escape(event_name)}",
+        f"<b>Market:</b> {html_escape(market_name)}",
+        f"<b>Edge:</b> <code>{html_escape(format_pct(profit_pct))}</code>",
+        f"<b>Target payout:</b> <code>{html_escape(format_money(payout))}</code>",
+        f"<b>Total stake:</b> <code>{html_escape(format_money(total_cost))}</code>",
+        f"<b>Guaranteed profit:</b> <code>{html_escape(format_money(profit))}</code>",
     ]
     if cluster_id:
-        lines.append(f"*Cluster:* `{md_code(cluster_id)}`")
-    lines.extend(["", "*Required legs:*"])
+        lines.append(f"<b>Cluster:</b> <code>{html_escape(cluster_id)}</code>")
+    lines.extend(["", "<b>Required legs:</b>"])
 
     for index, leg in enumerate(legs, start=1):
         platform = str(leg.get("platform") or "unknown").title()
@@ -133,24 +142,24 @@ def format_arbitrage_alert(opportunity: Any) -> str:
         instrument = str(leg.get("instrument_id") or leg.get("instrumentId") or "")
         market = str(leg.get("market_name") or leg.get("marketName") or "")
 
-        platform_text = md_link(platform, url) if url else md_escape(platform)
+        platform_text = html_link(platform, url) if url else html_escape(platform)
         lines.append("")
-        lines.append(f"{index}\\. *{platform_text}* - `{md_code(outcome)}`")
+        lines.append(f"{index}. <b>{platform_text}</b> - <code>{html_escape(outcome)}</code>")
         if market:
-            lines.append(f"   *Book market:* {md_escape(market)}")
+            lines.append(f"   <b>Book market:</b> {html_escape(market)}")
         if instrument:
-            lines.append(f"   *Instrument:* `{md_code(short_id(instrument))}`")
+            lines.append(f"   <b>Instrument:</b> <code>{html_escape(short_id(instrument))}</code>")
         if vwap is not None:
-            lines.append(f"   *VWAP price:* `{md_code(format_price(vwap))}`")
+            lines.append(f"   <b>VWAP price:</b> <code>{html_escape(format_price(vwap))}</code>")
         if odds is not None:
-            lines.append(f"   *Effective odds:* `{md_code(format_price(odds))}x`")
-        lines.append(f"   *Stake:* `{md_code(format_money(stake))}`")
+            lines.append(f"   <b>Effective odds:</b> <code>{html_escape(format_price(odds))}x</code>")
+        lines.append(f"   <b>Stake:</b> <code>{html_escape(format_money(stake))}</code>")
 
     stale = data.get("max_data_age_seconds") or data.get("maxDataAgeSeconds")
     if stale is not None:
-        lines.extend(["", f"_Max quote age: {md_escape(str(round(float(stale), 3)))}s_"])
+        lines.extend(["", f"<i>Max quote age: {html_escape(str(round(float(stale), 3)))}s</i>"])
     lines.append("")
-    lines.append(md_escape("Manual execution only. Re-check markets before placing bets."))
+    lines.append(html_escape("Manual execution only. Re-check markets before placing bets."))
     return "\n".join(lines)
 
 
@@ -176,6 +185,20 @@ def md_link(label: str, url: str) -> str:
     safe_label = md_escape(label)
     safe_url = url.replace("\\", "\\\\").replace(")", "\\)")
     return f"[{safe_label}]({safe_url})"
+
+
+def html_escape(value: str) -> str:
+    return html.escape(value, quote=True)
+
+
+def html_link(label: str, url: str) -> str:
+    return f'<a href="{html_escape(url)}">{html_escape(label)}</a>'
+
+
+def strip_markup(value: str) -> str:
+    value = re.sub(r"<a\s+href=\"([^\"]+)\">([^<]+)</a>", r"\2 (\1)", value)
+    value = re.sub(r"</?(?:b|i|code)>", "", value)
+    return html.unescape(value)
 
 
 def format_money(value: float) -> str:
@@ -218,12 +241,12 @@ async def cli_async(args: argparse.Namespace) -> int:
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     bot = TelegramBot()
     if args.message:
-        await bot.send_message(md_escape(args.message))
+        await bot.send_message(html_escape(args.message))
     elif args.alert_json:
         with open(args.alert_json, "r", encoding="utf-8") as handle:
             await bot.send_alert(json.load(handle))
     else:
-        await bot.send_message(md_escape("wc-arbbot Telegram test alert"))
+        await bot.send_message(html_escape("wc-arbbot Telegram test alert"))
     return 0
 
 

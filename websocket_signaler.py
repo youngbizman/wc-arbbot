@@ -505,7 +505,10 @@ class SignalEngine:
         if self.config.dry_run or not self.telegram:
             LOGGER.info("Dry-run alert payload: %s", dataclasses.asdict(opportunity))
             return
-        await self.telegram.send_alert(opportunity)
+        try:
+            await self.telegram.send_alert(opportunity)
+        except Exception:
+            LOGGER.exception("Failed to send Telegram alert")
 
     def alert_key(self, canonical_id: str, legs: Sequence[Any], profit_pct: float) -> str:
         raw = json.dumps(
