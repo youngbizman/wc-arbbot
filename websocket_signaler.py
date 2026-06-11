@@ -26,7 +26,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 from urllib.parse import quote
 
-from indexer import OrderBook, OrderBookLevel, Platform, oddspapi_api_key, parse_datetime, safe_float
+from indexer import (
+    AsyncHTTPClient,
+    OrderBook,
+    OrderBookLevel,
+    Platform,
+    kalshi_headers,
+    oddspapi_api_key,
+    parse_kalshi_side,
+    parse_datetime,
+    safe_float,
+)
 from telegram_bot import TelegramBot
 
 try:
@@ -646,8 +656,6 @@ class ReconnectingListener:
         self.engine = engine
 
     async def run_forever(self) -> None:
-        if websockets is None:
-            raise RuntimeError("The 'websockets' package is required for live signalling")
         delay = self.config.reconnect_initial_seconds
         while True:
             try:
@@ -666,6 +674,8 @@ class ReconnectingListener:
         raise NotImplementedError
 
     async def connect(self, url: str, headers: Mapping[str, str] | None = None) -> Any:
+        if websockets is None:
+            raise RuntimeError("The 'websockets' package is required for WebSocket live signalling")
         if not url.startswith(("ws://", "wss://")):
             raise RuntimeError(f"{self.name} websocket URL must start with ws:// or wss://, got {url!r}")
         kwargs = {
@@ -871,6 +881,83 @@ class KalshiListener(ReconnectingListener):
         )
 
 
+class KalshiRestPollingListener(ReconnectingListener):
+    name = "kalshi"
+
+    def __init__(self, config: SignalerConfig, engine: SignalEngine, taxonomy: TaxonomyStore) -> None:
+        super().__init__(config, engine)
+        self.taxonomy = taxonomy
+        self.base_url = env_str(
+            "KALSHI_API_BASE_URL",
+            "https://api.elections.kalshi.com/trade-api/v2",
+        ).rstrip("/")
+        self.poll_seconds = float_env("KALSHI_REST_POLL_SECONDS", 15.0)
+        self.depth = int_env("KALSHI_REST_ORDERBOOK_DEPTH", 100)
+        self.batch_size = int_env("KALSHI_REST_BATCH_SIZE", 25)
+        self.http = AsyncHTTPClient(
+            timeout_seconds=float_env("KALSHI_REST_TIMEOUT_SECONDS", 15.0),
+            retries=int_env("KALSHI_REST_RETRIES", 2),
+            backoff_seconds=float_env("KALSHI_REST_BACKOFF_SECONDS", 0.3),
+        )
+
+    async def run_once(self) -> None:
+        tickers = sorted(
+            {
+                ref.market_id
+                for ref in self.taxonomy.refs_by_platform.get("kalshi", [])
+                if ref.market_id
+            }
+        )
+        if not tickers:
+            LOGGER.info("Skipping Kalshi REST polling: no market tickers in taxonomy")
+            await asyncio.sleep(3600)
+            return
+        LOGGER.info("Starting Kalshi REST polling for %s tickers every %.1fs", len(tickers), self.poll_seconds)
+        while True:
+            for chunk in chunks(tickers, self.batch_size):
+                await asyncio.gather(
+                    *(self.fetch_and_publish(ticker) for ticker in chunk),
+                    return_exceptions=True,
+                )
+            await asyncio.sleep(max(1.0, self.poll_seconds))
+
+    async def fetch_and_publish(self, ticker: str) -> None:
+        try:
+            data = await self.http.get_json(
+                f"{self.base_url}/markets/{quote(ticker)}/orderbook",
+                params={"depth": self.depth},
+                headers=kalshi_headers(),
+            )
+        except Exception:
+            LOGGER.debug("Kalshi REST orderbook fetch failed for %s", ticker, exc_info=True)
+            return
+        book = as_mapping(data.get("orderbook") if isinstance(data, Mapping) else data)
+        yes = book.get("yes")
+        no = book.get("no")
+        yes_book = MutableOrderBook()
+        yes_book.replace(
+            ((level.price, level.size) for level in parse_kalshi_side(yes, side="bid")),
+            ((level.price, level.size) for level in parse_kalshi_side(no, side="ask_from_no_bid")),
+        )
+        no_book = MutableOrderBook()
+        no_book.replace(
+            ((level.price, level.size) for level in parse_kalshi_side(no, side="bid")),
+            ((level.price, level.size) for level in parse_kalshi_side(yes, side="ask_from_no_bid")),
+        )
+        await self.engine.update_orderbook(
+            platform="kalshi",
+            instrument_id=f"{ticker}:yes",
+            orderbook=yes_book.snapshot("kalshi", f"{ticker}:yes"),
+            payload=data if isinstance(data, Mapping) else {},
+        )
+        await self.engine.update_orderbook(
+            platform="kalshi",
+            instrument_id=f"{ticker}:no",
+            orderbook=no_book.snapshot("kalshi", f"{ticker}:no"),
+            payload=data if isinstance(data, Mapping) else {},
+        )
+
+
 class AzuroListener(ReconnectingListener):
     name = "azuro"
 
@@ -1033,7 +1120,8 @@ class LiveSignaler:
             elif bool_env("SIGNAL_REQUIRE_KALSHI", False):
                 raise RuntimeError("SIGNAL_REQUIRE_KALSHI=true but Kalshi WebSocket auth is not configured")
             else:
-                LOGGER.warning("Skipping Kalshi live listener: Kalshi WebSocket auth is not configured")
+                LOGGER.warning("Kalshi WebSocket auth is not configured; using REST polling fallback")
+                listeners.append(KalshiRestPollingListener(self.config, self.engine, self.taxonomy))
         if "azuro" in enabled:
             listeners.append(AzuroListener(self.config, self.engine, self.taxonomy))
         if "oddspapi" in enabled:
@@ -1050,18 +1138,35 @@ class LiveSignaler:
             raise RuntimeError(
                 f"Only {len(listeners)} live platform(s) available ({live_names}), but "
                 f"SIGNAL_MIN_PLATFORMS={self.config.min_platforms}. Cross-platform arbitrage cannot be "
-                "signalled until another live source is authenticated, usually OddsPapi for Pinnacle/1xBet "
-                "or Kalshi WebSocket auth. Lower SIGNAL_MIN_PLATFORMS only for diagnostics."
+                "signalled until another live source is available. Lower SIGNAL_MIN_PLATFORMS only for diagnostics."
             )
         LOGGER.info(
             "Starting live signaler with %s listeners and %s canonical clusters",
             len(listeners),
             len(self.taxonomy.clusters),
         )
+        await self.send_startup_status(listeners)
         await asyncio.gather(
             self.engine.run_digest_loop(),
             *(listener.run_forever() for listener in listeners),
         )
+
+    async def send_startup_status(self, listeners: Sequence[ReconnectingListener]) -> None:
+        names = ", ".join(sorted({listener.name for listener in listeners}))
+        message = (
+            "wc-arbbot live signaler started\n"
+            f"Live sources: {names}\n"
+            f"Canonical clusters: {len(self.taxonomy.clusters)}\n"
+            f"Min platforms per alert: {self.config.min_platforms}\n"
+            f"Top alerts per digest: {self.config.max_alerts_per_digest}"
+        )
+        if self.config.dry_run or not self.engine.telegram:
+            LOGGER.info(message.replace("\n", " | "))
+            return
+        try:
+            await self.engine.telegram.send_message(message)
+        except Exception:
+            LOGGER.exception("Failed to send startup Telegram status")
 
 
 def choose_covering_outcomes(

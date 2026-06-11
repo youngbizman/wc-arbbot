@@ -199,10 +199,9 @@ jobs:
                 fi
                 ;;
               kalshi)
-                if [ -n "$KALSHI_BEARER_TOKEN" ] || [ -n "$KALSHI_API_KEY" ] || [ -n "$KALSHI_ACCESS_KEY" ]; then
-                  live_count=$((live_count + 1))
-                else
-                  echo "::warning title=Kalshi unavailable::kalshi is enabled, but Kalshi WebSocket auth is not configured."
+                live_count=$((live_count + 1))
+                if [ -z "$KALSHI_BEARER_TOKEN" ] && [ -z "$KALSHI_API_KEY" ] && [ -z "$KALSHI_ACCESS_KEY" ]; then
+                  echo "::notice title=Kalshi REST fallback::kalshi is enabled without WebSocket auth; public REST orderbook polling will be used."
                 fi
                 ;;
               esac
@@ -210,7 +209,7 @@ jobs:
           echo "Usable live platform count: $live_count"
 
           if [ -z "$KALSHI_BEARER_TOKEN" ] && [ -z "$KALSHI_API_KEY" ] && [ -z "$KALSHI_ACCESS_KEY" ]; then
-            echo "::warning title=Missing Kalshi auth::Kalshi WebSocket auth is not configured. Kalshi live order books will be skipped."
+            echo "::notice title=Missing Kalshi auth::Kalshi WebSocket auth is not configured. Kalshi REST polling will be used."
           else
             echo "Kalshi auth injected: yes"
           fi
