@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 from urllib.parse import quote
 
-from indexer import OrderBook, OrderBookLevel, Platform, parse_datetime, safe_float
+from indexer import OrderBook, OrderBookLevel, Platform, oddspapi_api_key, parse_datetime, safe_float
 from telegram_bot import TelegramBot
 
 try:
@@ -924,7 +924,7 @@ class OddsPapiListener(ReconnectingListener):
 
     def __init__(self, config: SignalerConfig, engine: SignalEngine) -> None:
         super().__init__(config, engine)
-        self.api_key = os.environ.get("ODDSPAPI_KEY") or os.environ.get("ODDSPAPI_API_KEY")
+        self.api_key = oddspapi_api_key()
         base = env_str("ODDSPAPI_WS_URL", "wss://api.oddspapi.io/v4/ws")
         self.url = f"{base}?apiKey={quote(self.api_key or '')}"
         self.bookmakers = {book.lower() for book in env_csv("ODDSPAPI_BOOKMAKERS")}
@@ -1037,7 +1037,7 @@ class LiveSignaler:
         if "azuro" in enabled:
             listeners.append(AzuroListener(self.config, self.engine, self.taxonomy))
         if "oddspapi" in enabled:
-            if os.environ.get("ODDSPAPI_KEY") or os.environ.get("ODDSPAPI_API_KEY"):
+            if oddspapi_api_key():
                 listeners.append(OddsPapiListener(self.config, self.engine))
             elif bool_env("SIGNAL_REQUIRE_ODDSPAPI", False):
                 raise RuntimeError("SIGNAL_REQUIRE_ODDSPAPI=true but ODDSPAPI_KEY is not available")
@@ -1045,6 +1045,14 @@ class LiveSignaler:
                 LOGGER.warning("Skipping OddsPapi live listener: ODDSPAPI_KEY is not available")
         if not listeners:
             raise RuntimeError("No signaler platforms enabled")
+        if len({listener.name for listener in listeners}) < self.config.min_platforms:
+            live_names = ", ".join(sorted({listener.name for listener in listeners})) or "none"
+            raise RuntimeError(
+                f"Only {len(listeners)} live platform(s) available ({live_names}), but "
+                f"SIGNAL_MIN_PLATFORMS={self.config.min_platforms}. Cross-platform arbitrage cannot be "
+                "signalled until another live source is authenticated, usually OddsPapi for Pinnacle/1xBet "
+                "or Kalshi WebSocket auth. Lower SIGNAL_MIN_PLATFORMS only for diagnostics."
+            )
         LOGGER.info(
             "Starting live signaler with %s listeners and %s canonical clusters",
             len(listeners),

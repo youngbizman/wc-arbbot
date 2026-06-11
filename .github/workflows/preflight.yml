@@ -14,10 +14,14 @@ jobs:
       LOG_LEVEL: INFO
       ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY }}
       ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_API_KEY }}
+      ODDSPAPI_TOKEN: ${{ secrets.ODDSPAPI_TOKEN }}
       ODDS_PAPI_KEY: ${{ secrets.ODDS_PAPI_KEY }}
+      ODDS_PAPI_TOKEN: ${{ secrets.ODDS_PAPI_TOKEN }}
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
       ODDSPAPI_KEY_VAR: ${{ vars.ODDSPAPI_KEY }}
       ODDSPAPI_API_KEY_VAR: ${{ vars.ODDSPAPI_API_KEY }}
+      ODDSPAPI_TOKEN_VAR: ${{ vars.ODDSPAPI_TOKEN }}
       TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       POLYMARKET_DISCOVERY_JSON: seed/polymarket_world_cup.json
@@ -34,7 +38,23 @@ jobs:
       - name: Normalize OddsPapi key
         shell: bash
         run: |
-          canonical="${ODDSPAPI_KEY:-${ODDSPAPI_API_KEY:-${ODDS_PAPI_KEY:-${ODDS_API_KEY:-${ODDSPAPI_KEY_VAR:-$ODDSPAPI_API_KEY_VAR}}}}}"
+          canonical=""
+          for candidate in \
+            "$ODDSPAPI_KEY" \
+            "$ODDSPAPI_API_KEY" \
+            "$ODDSPAPI_TOKEN" \
+            "$ODDS_PAPI_KEY" \
+            "$ODDS_PAPI_TOKEN" \
+            "$ODDS_API_KEY" \
+            "$THE_ODDS_API_KEY" \
+            "$ODDSPAPI_KEY_VAR" \
+            "$ODDSPAPI_API_KEY_VAR" \
+            "$ODDSPAPI_TOKEN_VAR"; do
+            if [ -n "$candidate" ]; then
+              canonical="$candidate"
+              break
+            fi
+          done
           {
             echo "ODDSPAPI_KEY=$canonical"
             echo "ODDSPAPI_API_KEY=$canonical"
@@ -46,6 +66,10 @@ jobs:
           echo "TELEGRAM_BOT_KEY injected: $([ -n "$TELEGRAM_BOT_KEY" ] && echo yes || echo no)"
           echo "TELEGRAM_GROUP_ID injected: $([ -n "$TELEGRAM_GROUP_ID" ] && echo yes || echo no)"
           echo "ODDSPAPI_KEY injected: $([ -n "$ODDSPAPI_KEY" ] && echo yes || echo no)"
+          echo "ODDSPAPI_API_KEY alias injected: $([ -n "$ODDSPAPI_API_KEY" ] && echo yes || echo no)"
+          echo "ODDSPAPI_TOKEN alias injected: $([ -n "$ODDSPAPI_TOKEN" ] && echo yes || echo no)"
+          echo "ODDS_PAPI_KEY alias injected: $([ -n "$ODDS_PAPI_KEY" ] && echo yes || echo no)"
+          echo "ODDS_API_KEY alias injected: $([ -n "$ODDS_API_KEY" ] && echo yes || echo no)"
           if [ -z "$TELEGRAM_BOT_KEY" ] || [ -z "$TELEGRAM_GROUP_ID" ]; then
             echo "::error title=Missing Telegram secret::TELEGRAM_BOT_KEY and TELEGRAM_GROUP_ID are required"
             exit 1

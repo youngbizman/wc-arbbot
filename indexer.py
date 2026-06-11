@@ -590,7 +590,7 @@ class OddsPapiIndexer(BaseIndexer):
 
     def __init__(self, config: IndexerConfig, http: AsyncHTTPClient, window: TimeWindow) -> None:
         super().__init__(config, http, window)
-        self.api_key = os.environ.get("ODDSPAPI_KEY") or os.environ.get("ODDSPAPI_API_KEY")
+        self.api_key = oddspapi_api_key()
         self.base_url = env_str("ODDSPAPI_BASE_URL", "https://api.oddspapi.io").rstrip("/")
         self.odds_path = env_str("ODDSPAPI_ODDS_PATH", "/v4/odds-by-tournaments")
         self.local_json_path = os.environ.get("ODDSPAPI_DISCOVERY_JSON")
@@ -1219,6 +1219,25 @@ def env_str(name: str, default: str) -> str:
 def env_csv(name: str) -> list[str]:
     value = os.environ.get(name, "")
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def oddspapi_api_key() -> str | None:
+    aliases = (
+        "ODDSPAPI_KEY",
+        "ODDSPAPI_API_KEY",
+        "ODDSPAPI_TOKEN",
+        "ODDS_PAPI_KEY",
+        "ODDS_PAPI_TOKEN",
+        "ODDS_API_KEY",
+        "THE_ODDS_API_KEY",
+        "oddspapi_key",
+        "oddspapi_api_key",
+    )
+    for alias in aliases:
+        value = os.environ.get(alias)
+        if value and value.strip():
+            return value.strip()
+    return None
 
 
 def int_env(name: str, default: int) -> int:

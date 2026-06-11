@@ -63,10 +63,14 @@ jobs:
       LOG_LEVEL: INFO
       ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY }}
       ODDSPAPI_API_KEY: ${{ secrets.ODDSPAPI_API_KEY }}
+      ODDSPAPI_TOKEN: ${{ secrets.ODDSPAPI_TOKEN }}
       ODDS_PAPI_KEY: ${{ secrets.ODDS_PAPI_KEY }}
+      ODDS_PAPI_TOKEN: ${{ secrets.ODDS_PAPI_TOKEN }}
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
       ODDSPAPI_KEY_VAR: ${{ vars.ODDSPAPI_KEY }}
       ODDSPAPI_API_KEY_VAR: ${{ vars.ODDSPAPI_API_KEY }}
+      ODDSPAPI_TOKEN_VAR: ${{ vars.ODDSPAPI_TOKEN }}
       TELEGRAM_BOT_KEY: ${{ secrets.TELEGRAM_BOT_KEY }}
       TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
       KALSHI_API_KEY: ${{ secrets.KALSHI_API_KEY }}
@@ -103,7 +107,23 @@ jobs:
       - name: Normalize OddsPapi key
         shell: bash
         run: |
-          canonical="${ODDSPAPI_KEY:-${ODDSPAPI_API_KEY:-${ODDS_PAPI_KEY:-${ODDS_API_KEY:-${ODDSPAPI_KEY_VAR:-$ODDSPAPI_API_KEY_VAR}}}}}"
+          canonical=""
+          for candidate in \
+            "$ODDSPAPI_KEY" \
+            "$ODDSPAPI_API_KEY" \
+            "$ODDSPAPI_TOKEN" \
+            "$ODDS_PAPI_KEY" \
+            "$ODDS_PAPI_TOKEN" \
+            "$ODDS_API_KEY" \
+            "$THE_ODDS_API_KEY" \
+            "$ODDSPAPI_KEY_VAR" \
+            "$ODDSPAPI_API_KEY_VAR" \
+            "$ODDSPAPI_TOKEN_VAR"; do
+            if [ -n "$candidate" ]; then
+              canonical="$candidate"
+              break
+            fi
+          done
           {
             echo "ODDSPAPI_KEY=$canonical"
             echo "ODDSPAPI_API_KEY=$canonical"
@@ -120,14 +140,45 @@ jobs:
             fi
           done
           if [ -z "$ODDSPAPI_KEY" ]; then
-            echo "::warning title=Missing OddsPapi key::ODDSPAPI_KEY was not injected. The bot will run, but Pinnacle and 1xBet coverage from OddsPapi will be skipped until the secret name/value is fixed."
+            echo "::warning title=Missing OddsPapi key::ODDSPAPI_KEY was not injected. Pinnacle and 1xBet coverage from OddsPapi will be unavailable until the secret name/value is fixed."
           else
             echo "OddsPapi key injected: yes"
           fi
+
+          live_count=0
+          IFS=',' read -ra listeners <<< "$SIGNALER_PLATFORMS"
+          for raw in "${listeners[@]}"; do
+            name="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | xargs)"
+            case "$name" in
+              polymarket|azuro)
+                live_count=$((live_count + 1))
+                ;;
+              oddspapi)
+                if [ -n "$ODDSPAPI_KEY" ]; then
+                  live_count=$((live_count + 1))
+                else
+                  echo "::warning title=OddsPapi unavailable::oddspapi is enabled, but no OddsPapi key was injected."
+                fi
+                ;;
+              kalshi)
+                if [ -n "$KALSHI_BEARER_TOKEN" ] || [ -n "$KALSHI_API_KEY" ] || [ -n "$KALSHI_ACCESS_KEY" ]; then
+                  live_count=$((live_count + 1))
+                else
+                  echo "::warning title=Kalshi unavailable::kalshi is enabled, but Kalshi WebSocket auth is not configured."
+                fi
+                ;;
+              esac
+          done
+          echo "Usable live platform count: $live_count"
+
           if [ -z "$KALSHI_BEARER_TOKEN" ] && [ -z "$KALSHI_API_KEY" ] && [ -z "$KALSHI_ACCESS_KEY" ]; then
             echo "::warning title=Missing Kalshi auth::Kalshi WebSocket auth is not configured. Kalshi live order books will be skipped."
           else
             echo "Kalshi auth injected: yes"
+          fi
+          if [ "$live_count" -lt "$SIGNAL_MIN_PLATFORMS" ]; then
+            echo "::error title=Not enough live platforms::${live_count} live platform(s) available, but SIGNAL_MIN_PLATFORMS=${SIGNAL_MIN_PLATFORMS}. With the current settings the bot cannot produce cross-platform arbitrage alerts."
+            missing=1
           fi
           exit "$missing"
 
