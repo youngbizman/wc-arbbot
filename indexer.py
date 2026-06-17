@@ -36,6 +36,17 @@ from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 LOGGER = logging.getLogger("wc_arbbot.indexer")
 UTC = dt.timezone.utc
+_ODDSPAPI_TOURNAMENT_CACHE: dict[tuple[str, int, str], tuple[str, ...]] = {}
+_ODDSPAPI_PARTICIPANT_CACHE: dict[tuple[str, int, str], dict[str, str]] = {}
+
+
+class HTTPRequestError(RuntimeError):
+    def __init__(self, method: str, url: str, status_code: int, body: str) -> None:
+        self.method = method
+        self.url = url
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"HTTP {status_code} from {url}: {body[:500]}")
 
 
 class Platform(StrEnum):
@@ -278,6 +289,15 @@ class AsyncHTTPClient:
                     body,
                     request_headers,
                 )
+            except HTTPRequestError as exc:
+                last_error = exc
+                if not retryable_http_status(exc.status_code) or attempt >= self.retries:
+                    break
+                sleep_for = http_retry_delay(exc.body)
+                if sleep_for is None:
+                    sleep_for = self.backoff_seconds * (2 ** (attempt - 1))
+                    sleep_for += random.uniform(0.0, self.backoff_seconds)
+                await asyncio.sleep(sleep_for)
             except Exception as exc:  # noqa: BLE001 - preserve retry behavior
                 last_error = exc
                 if attempt >= self.retries:
@@ -285,6 +305,8 @@ class AsyncHTTPClient:
                 sleep_for = self.backoff_seconds * (2 ** (attempt - 1))
                 sleep_for += random.uniform(0.0, self.backoff_seconds)
                 await asyncio.sleep(sleep_for)
+        if isinstance(last_error, HTTPRequestError):
+            raise last_error
         raise RuntimeError(f"{method} {url} failed after {self.retries} attempts") from last_error
 
     def _request_json_sync(
@@ -305,7 +327,7 @@ class AsyncHTTPClient:
                 payload = response.read()
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} from {url}: {error_body[:500]}") from exc
+            raise HTTPRequestError(method, url, exc.code, error_body) from exc
         text = payload.decode("utf-8", errors="replace")
         if not text:
             return None
@@ -593,6 +615,10 @@ class OddsPapiIndexer(BaseIndexer):
         self.api_key = oddspapi_api_key()
         self.base_url = env_str("ODDSPAPI_BASE_URL", "https://api.oddspapi.io").rstrip("/")
         self.odds_path = env_str("ODDSPAPI_ODDS_PATH", "/v4/odds-by-tournaments")
+        self.tournaments_path = env_str("ODDSPAPI_TOURNAMENTS_PATH", "/v4/tournaments")
+        self.participants_path = env_str("ODDSPAPI_PARTICIPANTS_PATH", "/v4/participants")
+        self.language = env_str("ODDSPAPI_LANGUAGE", "en")
+        self.sport_id = int_env("ODDSPAPI_SPORT_ID", 10)
         self.local_json_path = os.environ.get("ODDSPAPI_DISCOVERY_JSON")
 
     def source_is_world_cup_scoped(self) -> bool:
@@ -604,6 +630,7 @@ class OddsPapiIndexer(BaseIndexer):
         )
 
     async def fetch_markets(self) -> list[MarketRecord]:
+        participant_names: Mapping[str, str] = {}
         if self.local_json_path:
             payload = load_json(Path(self.local_json_path))
         elif not self.api_key:
@@ -611,26 +638,157 @@ class OddsPapiIndexer(BaseIndexer):
             return []
         else:
             payload = await self._fetch_odds()
+            if truthy(os.environ.get("ODDSPAPI_FETCH_PARTICIPANTS", "true")):
+                participant_names = await self._fetch_participant_names()
         rows = self._extract_events(payload)
-        records = self._normalize_events(rows)
+        records = self._normalize_events(rows, participant_names=participant_names)
         return [m for m in records if self.keep_market(m)]
 
     async def _fetch_odds(self) -> Any:
+        tournament_ids = await self._resolve_tournament_ids()
+        if not tournament_ids:
+            LOGGER.warning(
+                "Skipping OddsPapi odds fetch: no tournament IDs matched %r",
+                env_str("ODDSPAPI_TOURNAMENT_SEARCH", env_str("ODDSPAPI_TOURNAMENT_NAME", "FIFA World Cup")),
+            )
+            return []
         params = {
             "apiKey": self.api_key,
             "bookmakers": ",".join(self.config.odds_papi_bookmakers),
             "verbosity": int_env("ODDSPAPI_VERBOSITY", 3),
-            "from": int(self.window.start.timestamp()),
-            "to": int(self.window.end.timestamp()),
-            "sport": env_str("ODDSPAPI_SPORT", "soccer"),
+            "language": self.language,
+            "oddsFormat": env_str("ODDSPAPI_ODDS_FORMAT", "decimal"),
+            "tournamentIds": ",".join(tournament_ids),
         }
-        tournament_ids = env_csv("ODDSPAPI_TOURNAMENT_IDS")
-        if tournament_ids:
-            params["tournamentIds"] = ",".join(tournament_ids)
-        tournament_name = os.environ.get("ODDSPAPI_TOURNAMENT_NAME")
-        if tournament_name:
-            params["tournamentName"] = tournament_name
         return await self.http.get_json(f"{self.base_url}{self.odds_path}", params=params)
+
+    async def _resolve_tournament_ids(self) -> tuple[str, ...]:
+        explicit_ids = env_csv("ODDSPAPI_TOURNAMENT_IDS")
+        singular_id = clean_text_or_none(os.environ.get("ODDSPAPI_TOURNAMENT_ID"))
+        if singular_id:
+            explicit_ids.append(singular_id)
+        if explicit_ids:
+            return tuple(dict.fromkeys(explicit_ids))
+
+        search = env_str("ODDSPAPI_TOURNAMENT_SEARCH", env_str("ODDSPAPI_TOURNAMENT_NAME", "FIFA World Cup"))
+        cache_key = (self.base_url, self.sport_id, clean_key(search))
+        if cache_key in _ODDSPAPI_TOURNAMENT_CACHE:
+            return _ODDSPAPI_TOURNAMENT_CACHE[cache_key]
+
+        if not self.api_key:
+            return ()
+        params = {
+            "apiKey": self.api_key,
+            "sportId": self.sport_id,
+            "language": self.language,
+        }
+        payload = await self.http.get_json(f"{self.base_url}{self.tournaments_path}", params=params)
+        tournament_ids = self._select_tournament_ids(payload, search)
+        _ODDSPAPI_TOURNAMENT_CACHE[cache_key] = tournament_ids
+        return tournament_ids
+
+    def _select_tournament_ids(self, payload: Any, search: str) -> tuple[str, ...]:
+        rows = only_mappings(unwrap_list(payload))
+        terms = env_csv("ODDSPAPI_TOURNAMENT_MATCH_TERMS") or [
+            search,
+            "fifa world cup",
+            "world cup",
+        ]
+        excludes = env_csv("ODDSPAPI_TOURNAMENT_EXCLUDE_TERMS") or [
+            "women",
+            "woman",
+            "club",
+            "qualifier",
+            "qualification",
+            "u17",
+            "u 17",
+            "u20",
+            "u 20",
+            "u21",
+            "u 21",
+            "beach",
+            "futsal",
+        ]
+        scored: list[tuple[float, str, str]] = []
+        for row in rows:
+            tournament_id = clean_text_or_none(first_present(row, "tournamentId", "id"))
+            if not tournament_id:
+                continue
+            name = clean_text_or_none(first_present(row, "tournamentName", "name", "title")) or tournament_id
+            haystack = clean_key(
+                " ".join(
+                    str(part)
+                    for part in (
+                        name,
+                        row.get("tournamentSlug"),
+                        row.get("categoryName"),
+                        row.get("categorySlug"),
+                    )
+                    if part
+                )
+            )
+            if any(clean_key(term) in haystack for term in excludes if clean_key(term)):
+                continue
+            score = 0.0
+            name_key = clean_key(name)
+            for term in terms:
+                term_key = clean_key(term)
+                if not term_key:
+                    continue
+                if name_key == term_key:
+                    score += 100.0
+                elif term_key in haystack:
+                    score += 50.0 + min(len(term_key), 25)
+            activity = sum(
+                safe_float(row.get(key)) or 0.0
+                for key in ("liveFixtures", "upcomingFixtures", "futureFixtures")
+            )
+            if activity:
+                score += min(activity, 20.0)
+            if score > 0:
+                scored.append((score, tournament_id, name))
+        scored.sort(reverse=True, key=lambda item: item[0])
+        limit = max(1, int_env("ODDSPAPI_MAX_TOURNAMENT_IDS", 4))
+        selected = tuple(item[1] for item in scored[:limit])
+        if selected:
+            LOGGER.info(
+                "Resolved OddsPapi tournament IDs %s for %r (%s)",
+                ",".join(selected),
+                search,
+                "; ".join(f"{name}:{tid}" for _, tid, name in scored[:limit]),
+            )
+        else:
+            sample = ", ".join(
+                clean_text_or_none(first_present(row, "tournamentName", "name", "title")) or "unknown"
+                for row in rows[:10]
+            )
+            LOGGER.warning("No OddsPapi tournament matched %r. Sample tournaments: %s", search, sample)
+        return selected
+
+    async def _fetch_participant_names(self) -> Mapping[str, str]:
+        cache_key = (self.base_url, self.sport_id, self.language)
+        if cache_key in _ODDSPAPI_PARTICIPANT_CACHE:
+            return _ODDSPAPI_PARTICIPANT_CACHE[cache_key]
+        if not self.api_key:
+            return {}
+        params = {
+            "apiKey": self.api_key,
+            "sportId": self.sport_id,
+            "language": self.language,
+        }
+        try:
+            payload = await self.http.get_json(f"{self.base_url}{self.participants_path}", params=params)
+        except Exception as exc:  # noqa: BLE001 - participant names are enrichment, not a hard dependency.
+            LOGGER.warning("Could not fetch OddsPapi participant names: %s", exc)
+            return {}
+        names: dict[str, str] = {}
+        if isinstance(payload, Mapping):
+            for participant_id, name in payload.items():
+                text = clean_text_or_none(name)
+                if text:
+                    names[str(participant_id)] = text
+        _ODDSPAPI_PARTICIPANT_CACHE[cache_key] = names
+        return names
 
     def _extract_events(self, payload: Any) -> list[Mapping[str, Any]]:
         if isinstance(payload, list):
@@ -642,13 +800,22 @@ class OddsPapiIndexer(BaseIndexer):
                 return only_mappings(payload[key])
         return only_mappings(unwrap_list(payload))
 
-    def _normalize_events(self, events: Sequence[Mapping[str, Any]]) -> list[MarketRecord]:
+    def _normalize_events(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        participant_names: Mapping[str, str] | None = None,
+    ) -> list[MarketRecord]:
         records: list[MarketRecord] = []
+        participant_names = participant_names or {}
         for event in events:
+            if isinstance(event.get("bookmakerOdds"), Mapping):
+                records.extend(self._normalize_odds_papi_event(event, participant_names))
+                continue
             event_id = clean_text_or_none(first_present(event, "id", "eventId", "fixtureId", "gameId"))
             event_name = clean_text_or_none(
                 first_present(event, "name", "eventName", "fixtureName", "gameName", "title")
-            ) or infer_event_name(event)
+            ) or odds_papi_event_name(event, participant_names)
             start_time = parse_datetime(
                 first_present(event, "startTime", "commenceTime", "commence_time", "startsAt", "date")
             )
@@ -673,6 +840,123 @@ class OddsPapiIndexer(BaseIndexer):
                     if record:
                         records.append(record)
         return records
+
+    def _normalize_odds_papi_event(
+        self,
+        event: Mapping[str, Any],
+        participant_names: Mapping[str, str],
+    ) -> list[MarketRecord]:
+        records: list[MarketRecord] = []
+        event_id = clean_text_or_none(first_present(event, "fixtureId", "id", "eventId", "gameId"))
+        event_name = odds_papi_event_name(event, participant_names)
+        home_name, away_name = odds_papi_participant_names(event, participant_names)
+        start_time = parse_datetime(
+            first_present(event, "startTime", "commenceTime", "commence_time", "startsAt", "date")
+        )
+        bookmaker_odds = event.get("bookmakerOdds")
+        if not isinstance(bookmaker_odds, Mapping):
+            return records
+        for bookmaker, book_payload in bookmaker_odds.items():
+            bookmaker_key = str(bookmaker).strip().lower()
+            if bookmaker_key not in self.config.odds_papi_bookmakers:
+                continue
+            if not isinstance(book_payload, Mapping):
+                continue
+            if "bookmakerIsActive" in book_payload and not truthy(book_payload.get("bookmakerIsActive")):
+                continue
+            if truthy(book_payload.get("suspended")):
+                continue
+            platform = Platform(bookmaker_key) if bookmaker_key in {"pinnacle", "1xbet"} else Platform.ODDS_PAPI
+            for market_key, market in iter_keyed_mappings(book_payload.get("markets")):
+                if "marketActive" in market and not truthy(market.get("marketActive")):
+                    continue
+                market_name = odds_papi_market_name(market_key, market)
+                outcomes = self._normalize_odds_papi_market_outcomes(
+                    market_key=market_key,
+                    market=market,
+                    home_name=home_name,
+                    away_name=away_name,
+                )
+                if not outcomes:
+                    continue
+                market_id = ":".join(
+                    filter(None, [platform.value, event_id, market_key or slugify(market_name)])
+                )
+                record = MarketRecord(
+                    platform=platform,
+                    market_id=market_id,
+                    event_id=event_id,
+                    event_name=event_name,
+                    market_name=market_name,
+                    market_type=odds_papi_market_type(market_key, market),
+                    outcomes=tuple(outcomes),
+                    start_time=start_time,
+                    close_time=parse_datetime(first_present(market, "closeTime", "endsAt")),
+                    resolve_time=start_time,
+                    updated_at=parse_datetime(first_present(event, "updatedAt", "lastUpdatedAt", "timestamp"))
+                    or parse_datetime(first_present(book_payload, "updatedAt", "lastUpdatedAt")),
+                    status=clean_text_or_none(first_present(event, "statusName", "status", "state", "statusId")),
+                    url=clean_text_or_none(first_present(book_payload, "fixturePath", "url", "link")),
+                    liquidity=max_optional(outcome.limit for outcome in outcomes),
+                    limit=max_optional(outcome.limit for outcome in outcomes),
+                    parent_event_name=event_name,
+                    mutually_exclusive_group_id=f"{event_id}:{market_key}" if event_id and market_key else None,
+                    raw={"event": event, "book": book_payload, "market": market},
+                )
+                records.append(record)
+        return records
+
+    def _normalize_odds_papi_market_outcomes(
+        self,
+        *,
+        market_key: str,
+        market: Mapping[str, Any],
+        home_name: str | None,
+        away_name: str | None,
+    ) -> list[MarketOutcome]:
+        outcomes: list[MarketOutcome] = []
+        for outcome_key, outcome_payload in iter_keyed_mappings(market.get("outcomes")):
+            player_items = list(iter_keyed_mappings(outcome_payload.get("players")))
+            if not player_items:
+                player_items = [("0", outcome_payload)]
+            for player_key, player_payload in player_items:
+                if "active" in player_payload and not truthy(player_payload.get("active")):
+                    continue
+                bookmaker_outcome_id = clean_text_or_none(
+                    first_present(
+                        player_payload,
+                        "bookmakerOutcomeId",
+                        "outcomeName",
+                        "name",
+                        "label",
+                    )
+                ) or clean_text_or_none(first_present(outcome_payload, "bookmakerOutcomeId", "name", "label"))
+                player_name = clean_text_or_none(first_present(player_payload, "playerName", "participantName"))
+                outcome_name = odds_papi_outcome_name(bookmaker_outcome_id or outcome_key, home_name, away_name)
+                if player_name:
+                    outcome_name = f"{player_name} {outcome_name}"
+                decimal_odds = safe_float(
+                    first_present(player_payload, "price", "decimal", "decimalOdds", "odds", "value")
+                )
+                if not decimal_odds or decimal_odds <= 1:
+                    continue
+                normalized_outcome_id = outcome_key if player_key in {"", "0"} else f"{outcome_key}:{player_key}"
+                outcomes.append(
+                    MarketOutcome(
+                        outcome_id=normalized_outcome_id,
+                        name=outcome_name,
+                        platform_outcome_id=bookmaker_outcome_id,
+                        decimal_odds=decimal_odds,
+                        probability=1.0 / decimal_odds,
+                        limit=safe_float(first_present(player_payload, "limit", "maxBet", "maxStake")),
+                        raw={
+                            "marketId": market_key,
+                            "outcome": outcome_payload,
+                            "player": player_payload,
+                        },
+                    )
+                )
+        return outcomes
 
     def _normalize_book_market(
         self,
@@ -1102,6 +1386,23 @@ def only_mappings(values: Iterable[Any]) -> list[Mapping[str, Any]]:
     return [v for v in values if isinstance(v, Mapping)]
 
 
+def iter_keyed_mappings(value: Any) -> Iterable[tuple[str, Mapping[str, Any]]]:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(item, Mapping):
+                yield str(key), item
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for idx, item in enumerate(value):
+            if isinstance(item, Mapping):
+                key = clean_text_or_none(first_present(item, "id", "key", "marketId", "outcomeId")) or str(idx)
+                yield key, item
+
+
+def max_optional(values: Iterable[float | None]) -> float | None:
+    parsed = [value for value in values if value is not None]
+    return max(parsed) if parsed else None
+
+
 def extract_deep_list(payload: Any, keys: Sequence[str]) -> list[Any]:
     if isinstance(payload, list):
         return payload
@@ -1193,6 +1494,11 @@ def clean_text_or_none(value: Any) -> str | None:
     return text or None
 
 
+def clean_key(value: Any) -> str:
+    text = clean_text_or_none(value) or ""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
 def truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -1209,6 +1515,29 @@ def append_query(url: str, params: Mapping[str, Any]) -> str:
         **{k: v for k, v in params.items() if v is not None},
     }
     return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query, doseq=True)))
+
+
+def retryable_http_status(status_code: int) -> bool:
+    return status_code == 408 or status_code == 429 or status_code >= 500
+
+
+def http_retry_delay(body: str) -> float | None:
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, Mapping) else None
+    if not isinstance(error, Mapping):
+        return None
+    retry_ms = safe_float(error.get("retryMs"))
+    if retry_ms is not None:
+        return max(0.1, min(30.0, retry_ms / 1000.0 + 0.1))
+    retry_after = clean_text_or_none(error.get("retryAfter"))
+    if retry_after:
+        number = safe_float(re.search(r"\d+(\.\d+)?", retry_after).group(0)) if re.search(r"\d+(\.\d+)?", retry_after) else None
+        if number is not None:
+            return max(0.1, min(30.0, number + 0.1))
+    return None
 
 
 def env_str(name: str, default: str) -> str:
@@ -1285,6 +1614,94 @@ def infer_event_name(event: Mapping[str, Any]) -> str:
     if len(names) >= 2:
         return f"{names[0]} vs. {names[1]}"
     return clean_text_or_none(first_present(event, "slug", "id")) or "unknown event"
+
+
+def odds_papi_participant_names(
+    event: Mapping[str, Any],
+    participant_names: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    participant1_id = clean_text_or_none(first_present(event, "participant1Id", "homeParticipantId", "homeId"))
+    participant2_id = clean_text_or_none(first_present(event, "participant2Id", "awayParticipantId", "awayId"))
+    home = clean_text_or_none(
+        first_present(event, "participant1Name", "participant1ShortName", "home", "homeTeam", "team1")
+    )
+    away = clean_text_or_none(
+        first_present(event, "participant2Name", "participant2ShortName", "away", "awayTeam", "team2")
+    )
+    if not home and participant1_id:
+        home = participant_names.get(participant1_id)
+    if not away and participant2_id:
+        away = participant_names.get(participant2_id)
+    return home, away
+
+
+def odds_papi_event_name(event: Mapping[str, Any], participant_names: Mapping[str, str]) -> str:
+    direct = clean_text_or_none(first_present(event, "name", "eventName", "fixtureName", "gameName", "title"))
+    if direct:
+        return direct
+    home, away = odds_papi_participant_names(event, participant_names)
+    if home and away:
+        return f"{home} vs. {away}"
+    return infer_event_name(event)
+
+
+def odds_papi_market_type(market_key: str | None, market: Mapping[str, Any]) -> str | None:
+    text = clean_key(
+        " ".join(
+            str(part)
+            for part in (
+                market_key,
+                first_present(market, "key", "id", "marketId", "name", "marketName", "bookmakerMarketId"),
+            )
+            if part
+        )
+    )
+    if "moneyline" in text or "match winner" in text or market_key == "101":
+        return "moneyline"
+    if "total" in text or "over under" in text:
+        return "total"
+    if "spread" in text or "handicap" in text:
+        return "handicap"
+    return clean_text_or_none(first_present(market, "key", "id", "marketId", "name", "marketName")) or market_key
+
+
+def odds_papi_market_name(market_key: str | None, market: Mapping[str, Any]) -> str:
+    market_type = odds_papi_market_type(market_key, market)
+    if market_type == "moneyline":
+        return "Moneyline"
+    if market_type == "total":
+        return "Total Goals"
+    if market_type == "handicap":
+        return "Handicap"
+    return (
+        clean_text_or_none(first_present(market, "name", "marketName", "label", "bookmakerMarketId"))
+        or f"Market {market_key or 'unknown'}"
+    )
+
+
+def odds_papi_outcome_name(raw_label: str, home_name: str | None, away_name: str | None) -> str:
+    label = clean_text_or_none(raw_label) or "Outcome"
+    lower = label.lower().strip()
+    if lower == "home":
+        return home_name or "Home"
+    if lower == "away":
+        return away_name or "Away"
+    if lower == "draw":
+        return "Draw"
+
+    parts = [part.strip() for part in re.split(r"[/|]", lower) if part.strip()]
+    direction = next((part for part in parts if part in {"over", "under"}), None)
+    line = next((part for part in parts if re.fullmatch(r"[+-]?\d+(\.\d+)?", part)), None)
+    if direction and line:
+        return f"{direction.title()} {line}"
+
+    side = next((part for part in parts if part in {"home", "away"}), None)
+    if side and line:
+        team = home_name if side == "home" else away_name
+        return f"{team or side.title()} {line}"
+
+    cleaned = re.sub(r"[_/|]+", " ", label).strip()
+    return re.sub(r"\s+", " ", cleaned).title()
 
 
 def polymarket_url(row: Mapping[str, Any]) -> str | None:

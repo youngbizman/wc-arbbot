@@ -23,6 +23,14 @@ on:
         description: "Bookmakers to include inside OddsPapi"
         required: true
         default: "pinnacle,1xbet"
+      oddspapi_tournament_search:
+        description: "OddsPapi tournament search text used for auto-discovery"
+        required: true
+        default: "FIFA World Cup"
+      oddspapi_tournament_ids:
+        description: "Optional OddsPapi tournamentIds override; leave blank for auto-discovery"
+        required: false
+        default: ""
       oddspapi_secret_name:
         description: "Exact GitHub secret name containing the OddsPapi key"
         required: true
@@ -106,10 +114,12 @@ jobs:
       KALSHI_WS_URL: ${{ vars.KALSHI_WS_URL || 'wss://api.elections.kalshi.com/trade-api/ws/v2' }}
       ODDSPAPI_WS_URL: ${{ vars.ODDSPAPI_WS_URL || 'wss://api.oddspapi.io/v4/ws' }}
       ODDSPAPI_BASE_URL: ${{ vars.ODDSPAPI_BASE_URL }}
-      ODDSPAPI_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_TOURNAMENT_IDS }}
-      ODDSPAPI_TOURNAMENT_NAME: ${{ vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
+      ODDSPAPI_TOURNAMENT_IDS: ${{ inputs.oddspapi_tournament_ids || vars.ODDSPAPI_TOURNAMENT_IDS }}
+      ODDSPAPI_TOURNAMENT_SEARCH: ${{ inputs.oddspapi_tournament_search || vars.ODDSPAPI_TOURNAMENT_SEARCH || vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
+      ODDSPAPI_TOURNAMENT_NAME: ${{ inputs.oddspapi_tournament_search || vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
       ODDSPAPI_BOOKMAKERS: ${{ inputs.oddspapi_bookmakers || vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
       ODDSPAPI_LIVE_MODE: ${{ vars.ODDSPAPI_LIVE_MODE || 'poll' }}
+      ODDSPAPI_REST_POLL_SECONDS: ${{ vars.ODDSPAPI_REST_POLL_SECONDS || '60' }}
       POLYMARKET_DISCOVERY_JSON: /app/seed/polymarket_world_cup.json
       KALSHI_DISCOVERY_JSON: /app/seed/kalshi_world_cup.json
       WC_ARBBOT_WINDOW_HOURS: ${{ vars.WC_ARBBOT_WINDOW_HOURS || '48' }}
@@ -246,9 +256,11 @@ jobs:
             -e ODDSPAPI_WS_URL \
             -e ODDSPAPI_BASE_URL \
             -e ODDSPAPI_TOURNAMENT_IDS \
+            -e ODDSPAPI_TOURNAMENT_SEARCH \
             -e ODDSPAPI_TOURNAMENT_NAME \
             -e ODDSPAPI_BOOKMAKERS \
             -e ODDSPAPI_LIVE_MODE \
+            -e ODDSPAPI_REST_POLL_SECONDS \
             -e POLYMARKET_DISCOVERY_JSON \
             -e KALSHI_DISCOVERY_JSON \
             -e WC_ARBBOT_WINDOW_HOURS \

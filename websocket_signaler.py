@@ -29,6 +29,7 @@ from urllib.parse import quote
 
 from indexer import (
     AsyncHTTPClient,
+    HTTPRequestError,
     IndexerConfig,
     OrderBook,
     OrderBookLevel,
@@ -1122,7 +1123,11 @@ class OddsPapiRestPollingListener(ReconnectingListener):
     def __init__(self, config: SignalerConfig, engine: SignalEngine) -> None:
         super().__init__(config, engine)
         self.api_key = oddspapi_api_key()
-        self.poll_seconds = float_env("ODDSPAPI_REST_POLL_SECONDS", 20.0)
+        self.poll_seconds = float_env("ODDSPAPI_REST_POLL_SECONDS", 60.0)
+        self.initial_delay_seconds = float_env("ODDSPAPI_INITIAL_POLL_DELAY_SECONDS", 2.0)
+        self.permanent_error_backoff_seconds = float_env("ODDSPAPI_PERMANENT_ERROR_BACKOFF_SECONDS", 900.0)
+        self.next_poll_at = 0.0
+        self.failure_count = 0
         self.config_snapshot = IndexerConfig.from_env()
         self.http = AsyncHTTPClient(
             timeout_seconds=float_env("ODDSPAPI_REST_TIMEOUT_SECONDS", 20.0),
@@ -1140,18 +1145,44 @@ class OddsPapiRestPollingListener(ReconnectingListener):
             ",".join(self.config_snapshot.odds_papi_bookmakers),
             self.poll_seconds,
         )
+        if self.initial_delay_seconds > 0:
+            await asyncio.sleep(self.initial_delay_seconds)
         while True:
-            await self.poll_once()
+            now = time.monotonic()
+            if now < self.next_poll_at:
+                await asyncio.sleep(min(30.0, self.next_poll_at - now))
+                continue
+            ok = await self.poll_once()
+            if ok:
+                self.failure_count = 0
+            else:
+                self.failure_count += 1
             await asyncio.sleep(max(5.0, self.poll_seconds))
 
-    async def poll_once(self) -> None:
+    async def poll_once(self) -> bool:
         window = TimeWindow.next_hours(float_env("WC_ARBBOT_WINDOW_HOURS", self.config_snapshot.window_hours))
         indexer = OddsPapiIndexer(self.config_snapshot, self.http, window)
         try:
             markets = await indexer.fetch_markets()
+        except HTTPRequestError as exc:
+            if exc.status_code == 429:
+                delay = min(300.0, self.poll_seconds * max(1, self.failure_count + 1))
+                self.next_poll_at = time.monotonic() + delay
+                LOGGER.warning("OddsPapi REST poll rate-limited; backing off for %.0fs", delay)
+            elif 400 <= exc.status_code < 500:
+                self.next_poll_at = time.monotonic() + self.permanent_error_backoff_seconds
+                LOGGER.warning(
+                    "OddsPapi REST poll got a permanent HTTP %s error; backing off for %.0fs: %s",
+                    exc.status_code,
+                    self.permanent_error_backoff_seconds,
+                    exc.body[:250],
+                )
+            else:
+                LOGGER.warning("OddsPapi REST poll HTTP error: %s", exc)
+            return False
         except Exception:
             LOGGER.exception("OddsPapi REST poll failed")
-            return
+            return False
         updates = 0
         for market in markets:
             platform = market.platform.value if hasattr(market.platform, "value") else str(market.platform)
@@ -1177,6 +1208,7 @@ class OddsPapiRestPollingListener(ReconnectingListener):
                 )
                 updates += 1
         LOGGER.info("OddsPapi REST poll published %s fixed-odds updates from %s markets", updates, len(markets))
+        return True
 
 
 class LiveSignaler:
