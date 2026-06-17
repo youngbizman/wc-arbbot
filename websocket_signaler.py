@@ -52,6 +52,8 @@ except ImportError:  # pragma: no cover - runtime dependency.
 
 LOGGER = logging.getLogger("wc_arbbot.signaler")
 UTC = dt.timezone.utc
+GLOBALLY_UNIQUE_INSTRUMENT_PLATFORMS = {"polymarket", "kalshi"}
+FIXED_ODDS_PLATFORMS = {"pinnacle", "1xbet", "oddspapi", "azuro", "dexsport"}
 
 
 @dataclass(frozen=True)
@@ -378,13 +380,14 @@ class TaxonomyStore:
         source: Mapping[str, Any],
         outcome: Mapping[str, Any],
     ) -> set[str]:
-        aliases = {
-            ref.instrument_id,
-            ref.quote_key,
-            f"{ref.platform}:{ref.market_id}",
-            f"{ref.platform}:{ref.market_id}:{ref.outcome_id}",
-            f"{ref.platform}:{ref.market_id}:{ref.instrument_id}",
-        }
+        aliases = {ref.quote_key}
+        if ref.platform in GLOBALLY_UNIQUE_INSTRUMENT_PLATFORMS:
+            aliases.add(ref.instrument_id)
+            aliases.add(f"{ref.platform}:{ref.market_id}")
+            aliases.add(f"{ref.platform}:{ref.market_id}:{ref.instrument_id}")
+        else:
+            aliases.add(f"{ref.platform}:{ref.market_id}:{ref.outcome_id}")
+            aliases.add(f"{ref.platform}:{ref.market_id}:{ref.instrument_id}")
         event_id = str(source.get("event_id") or source.get("eventId") or "")
         market_type = str(source.get("market_type") or source.get("marketType") or "")
         platform_outcome_id = str(
@@ -394,7 +397,7 @@ class TaxonomyStore:
             or outcome.get("id")
             or ""
         )
-        if event_id:
+        if event_id and ref.platform not in GLOBALLY_UNIQUE_INSTRUMENT_PLATFORMS:
             aliases.add(f"{ref.platform}:{event_id}:{market_type}:{ref.outcome_id}")
             aliases.add(f"{ref.platform}:{event_id}:{market_type}:{platform_outcome_id}")
             aliases.add(f"{ref.platform}:{event_id}:{ref.market_id}:{ref.outcome_id}")
@@ -462,7 +465,17 @@ class SignalEngine:
         refs: list[InstrumentRef] = []
         seen: set[str] = set()
         for alias in aliases:
-            for ref in self.taxonomy.refs_by_alias.get(alias, []):
+            alias_refs = self.taxonomy.refs_by_alias.get(alias, [])
+            if not alias_refs:
+                continue
+            if fixed_odds_alias_is_ambiguous(alias_refs):
+                LOGGER.warning(
+                    "Skipping ambiguous fixed-odds alias %r touching canonical IDs: %s",
+                    alias,
+                    ",".join(sorted({ref.canonical_id for ref in alias_refs})[:5]),
+                )
+                continue
+            for ref in alias_refs:
                 if ref.quote_key not in seen:
                     seen.add(ref.quote_key)
                     refs.append(ref)
@@ -1015,8 +1028,6 @@ class AzuroListener(ReconnectingListener):
                 continue
             aliases = [
                 f"azuro:{condition_id}:{outcome_id}",
-                f"azuro:{condition_id}",
-                str(outcome_id),
             ]
             await self.engine.update_fixed_odds(
                 aliases=aliases,
@@ -1103,11 +1114,8 @@ class OddsPapiListener(ReconnectingListener):
         aliases = [
             f"{bookmaker}:{fixture_id}:{market_id}:{outcome_id}:{player_id}",
             f"{bookmaker}:{fixture_id}:{market_id}:{outcome_id}",
-            f"{bookmaker}:{fixture_id}:{market_id}",
             f"{bookmaker}:{market_id}:{outcome_id}:{player_id}",
             f"{bookmaker}:{market_id}:{outcome_id}",
-            str(payload.get("oddsId") or ""),
-            str(payload.get("bookmakerOutcomeId") or ""),
         ]
         await self.engine.update_fixed_odds(
             aliases=[alias for alias in aliases if alias and "None" not in alias],
@@ -1197,8 +1205,6 @@ class OddsPapiRestPollingListener(ReconnectingListener):
                     f"{platform}:{market.market_id}:{outcome.platform_outcome_id}",
                     f"{platform}:{market.event_id}:{market.market_type}:{outcome.outcome_id}",
                     f"{platform}:{market.event_id}:{market.market_type}:{outcome.platform_outcome_id}",
-                    str(outcome.outcome_id or ""),
-                    str(outcome.platform_outcome_id or ""),
                 ]
                 await self.engine.update_fixed_odds(
                     aliases=[alias for alias in aliases if alias and "None" not in alias],
@@ -1461,6 +1467,16 @@ def platform_env_keys(platform: str, suffix: str) -> tuple[str, str]:
     raw = platform.upper().replace("-", "_")
     normalized = raw.replace("1XBET", "ONEXBET")
     return f"{normalized}_{suffix}", f"{raw}_{suffix}"
+
+
+def fixed_odds_alias_is_ambiguous(refs: Sequence[InstrumentRef]) -> bool:
+    fixed_refs = [ref for ref in refs if ref.platform in FIXED_ODDS_PLATFORMS]
+    if not fixed_refs:
+        return False
+    canonical_ids = {ref.canonical_id for ref in fixed_refs}
+    market_ids = {ref.market_id for ref in fixed_refs}
+    outcome_keys = {ref.outcome_key for ref in fixed_refs}
+    return len(canonical_ids) > 1 or len(market_ids) > 1 or len(outcome_keys) > 1
 
 
 def chunks(items: Sequence[str], size: int) -> Iterable[Sequence[str]]:
