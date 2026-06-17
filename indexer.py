@@ -652,15 +652,24 @@ class OddsPapiIndexer(BaseIndexer):
                 env_str("ODDSPAPI_TOURNAMENT_SEARCH", env_str("ODDSPAPI_TOURNAMENT_NAME", "FIFA World Cup")),
             )
             return []
-        params = {
-            "apiKey": self.api_key,
-            "bookmakers": ",".join(self.config.odds_papi_bookmakers),
-            "verbosity": int_env("ODDSPAPI_VERBOSITY", 3),
-            "language": self.language,
-            "oddsFormat": env_str("ODDSPAPI_ODDS_FORMAT", "decimal"),
-            "tournamentIds": ",".join(tournament_ids),
-        }
-        return await self.http.get_json(f"{self.base_url}{self.odds_path}", params=params)
+        merged: list[Any] = []
+        bookmaker_param = env_str("ODDSPAPI_BOOKMAKER_PARAM", "bookmaker")
+        request_delay = float_env("ODDSPAPI_BOOKMAKER_REQUEST_DELAY_SECONDS", 1.1)
+        bookmakers = self.config.odds_papi_bookmakers or ("pinnacle",)
+        for idx, bookmaker in enumerate(bookmakers):
+            params = {
+                "apiKey": self.api_key,
+                bookmaker_param: bookmaker,
+                "verbosity": int_env("ODDSPAPI_VERBOSITY", 3),
+                "language": self.language,
+                "oddsFormat": env_str("ODDSPAPI_ODDS_FORMAT", "decimal"),
+                "tournamentIds": ",".join(tournament_ids),
+            }
+            payload = await self.http.get_json(f"{self.base_url}{self.odds_path}", params=params)
+            merged.extend(self._extract_events(payload))
+            if idx < len(bookmakers) - 1 and request_delay > 0:
+                await asyncio.sleep(request_delay)
+        return merged
 
     async def _resolve_tournament_ids(self) -> tuple[str, ...]:
         explicit_ids = env_csv("ODDSPAPI_TOURNAMENT_IDS")
@@ -689,6 +698,15 @@ class OddsPapiIndexer(BaseIndexer):
 
     def _select_tournament_ids(self, payload: Any, search: str) -> tuple[str, ...]:
         rows = only_mappings(unwrap_list(payload))
+        exact = self._exact_tournament_matches(rows, search)
+        if exact:
+            LOGGER.info(
+                "Resolved exact OddsPapi tournament ID %s for %r (%s)",
+                exact[0],
+                search,
+                exact[1],
+            )
+            return (exact[0],)
         terms = env_csv("ODDSPAPI_TOURNAMENT_MATCH_TERMS") or [
             search,
             "fifa world cup",
@@ -708,6 +726,11 @@ class OddsPapiIndexer(BaseIndexer):
             "u 21",
             "beach",
             "futsal",
+            "virtual",
+            "esoccer",
+            "e soccer",
+            "efootball",
+            "e football",
         ]
         scored: list[tuple[float, str, str]] = []
         for row in rows:
@@ -748,7 +771,7 @@ class OddsPapiIndexer(BaseIndexer):
             if score > 0:
                 scored.append((score, tournament_id, name))
         scored.sort(reverse=True, key=lambda item: item[0])
-        limit = max(1, int_env("ODDSPAPI_MAX_TOURNAMENT_IDS", 4))
+        limit = max(1, int_env("ODDSPAPI_MAX_TOURNAMENT_IDS", 1))
         selected = tuple(item[1] for item in scored[:limit])
         if selected:
             LOGGER.info(
@@ -764,6 +787,21 @@ class OddsPapiIndexer(BaseIndexer):
             )
             LOGGER.warning("No OddsPapi tournament matched %r. Sample tournaments: %s", search, sample)
         return selected
+
+    def _exact_tournament_matches(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        search: str,
+    ) -> tuple[str, str] | None:
+        search_key = clean_key(search)
+        if not search_key:
+            return None
+        for row in rows:
+            tournament_id = clean_text_or_none(first_present(row, "tournamentId", "id"))
+            name = clean_text_or_none(first_present(row, "tournamentName", "name", "title"))
+            if tournament_id and name and clean_key(name) == search_key:
+                return tournament_id, name
+        return None
 
     async def _fetch_participant_names(self) -> Mapping[str, str]:
         cache_key = (self.base_url, self.sport_id, self.language)
@@ -1245,6 +1283,14 @@ class WorldCupIndexer:
                 time.perf_counter() - started,
             )
             return markets
+        except HTTPRequestError as exc:
+            LOGGER.warning(
+                "Failed to fetch %s markets: HTTP %s %s",
+                indexer.platform.value,
+                exc.status_code,
+                exc.body[:250],
+            )
+            return []
         except Exception:
             LOGGER.exception("Failed to fetch %s markets", indexer.platform.value)
             return []
