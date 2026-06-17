@@ -656,19 +656,53 @@ class OddsPapiIndexer(BaseIndexer):
         bookmaker_param = env_str("ODDSPAPI_BOOKMAKER_PARAM", "bookmaker")
         request_delay = float_env("ODDSPAPI_BOOKMAKER_REQUEST_DELAY_SECONDS", 1.1)
         bookmakers = self.config.odds_papi_bookmakers or ("pinnacle",)
-        for idx, bookmaker in enumerate(bookmakers):
-            params = {
-                "apiKey": self.api_key,
-                bookmaker_param: bookmaker,
-                "verbosity": int_env("ODDSPAPI_VERBOSITY", 3),
-                "language": self.language,
-                "oddsFormat": env_str("ODDSPAPI_ODDS_FORMAT", "decimal"),
-                "tournamentIds": ",".join(tournament_ids),
-            }
-            payload = await self.http.get_json(f"{self.base_url}{self.odds_path}", params=params)
-            merged.extend(self._extract_events(payload))
-            if idx < len(bookmakers) - 1 and request_delay > 0:
-                await asyncio.sleep(request_delay)
+        call_count = 0
+        empty_pairs: list[str] = []
+        for bookmaker in bookmakers:
+            bookmaker_events = 0
+            for tournament_id in tournament_ids:
+                if call_count and request_delay > 0:
+                    await asyncio.sleep(request_delay)
+                call_count += 1
+                params = {
+                    "apiKey": self.api_key,
+                    bookmaker_param: bookmaker,
+                    "verbosity": int_env("ODDSPAPI_VERBOSITY", 3),
+                    "language": self.language,
+                    "oddsFormat": env_str("ODDSPAPI_ODDS_FORMAT", "decimal"),
+                    "tournamentIds": tournament_id,
+                }
+                try:
+                    payload = await self.http.get_json(f"{self.base_url}{self.odds_path}", params=params)
+                except HTTPRequestError as exc:
+                    if oddspapi_fixture_not_found(exc):
+                        empty_pairs.append(f"{bookmaker}:{tournament_id}")
+                        continue
+                    raise
+                events = self._extract_events(payload)
+                if events:
+                    LOGGER.info(
+                        "Fetched %s OddsPapi fixtures for bookmaker=%s tournamentId=%s",
+                        len(events),
+                        bookmaker,
+                        tournament_id,
+                    )
+                    bookmaker_events += len(events)
+                    merged.extend(events)
+            if bookmaker_events == 0:
+                LOGGER.warning(
+                    "No OddsPapi fixtures found for bookmaker=%s across tournament IDs %s",
+                    bookmaker,
+                    ",".join(tournament_ids),
+                )
+        if empty_pairs:
+            LOGGER.info("OddsPapi fixture-not-found pairs skipped: %s", ", ".join(empty_pairs[:12]))
+        if not merged:
+            LOGGER.warning(
+                "OddsPapi returned no fixtures for bookmakers=%s and tournament IDs=%s",
+                ",".join(bookmakers),
+                ",".join(tournament_ids),
+            )
         return merged
 
     async def _resolve_tournament_ids(self) -> tuple[str, ...]:
@@ -699,14 +733,6 @@ class OddsPapiIndexer(BaseIndexer):
     def _select_tournament_ids(self, payload: Any, search: str) -> tuple[str, ...]:
         rows = only_mappings(unwrap_list(payload))
         exact = self._exact_tournament_matches(rows, search)
-        if exact:
-            LOGGER.info(
-                "Resolved exact OddsPapi tournament ID %s for %r (%s)",
-                exact[0],
-                search,
-                exact[1],
-            )
-            return (exact[0],)
         terms = env_csv("ODDSPAPI_TOURNAMENT_MATCH_TERMS") or [
             search,
             "fifa world cup",
@@ -771,14 +797,34 @@ class OddsPapiIndexer(BaseIndexer):
             if score > 0:
                 scored.append((score, tournament_id, name))
         scored.sort(reverse=True, key=lambda item: item[0])
-        limit = max(1, int_env("ODDSPAPI_MAX_TOURNAMENT_IDS", 1))
-        selected = tuple(item[1] for item in scored[:limit])
+        limit = max(1, int_env("ODDSPAPI_MAX_TOURNAMENT_IDS", 3))
+        selected_list: list[str] = []
+        selected_names: dict[str, str] = {}
+        if exact:
+            selected_list.append(exact[0])
+            selected_names[exact[0]] = exact[1]
+            if truthy(os.environ.get("ODDSPAPI_STRICT_EXACT_TOURNAMENT", "false")):
+                LOGGER.info(
+                    "Resolved exact OddsPapi tournament ID %s for %r (%s)",
+                    exact[0],
+                    search,
+                    exact[1],
+                )
+                return (exact[0],)
+        for _, tournament_id, name in scored:
+            if tournament_id in selected_list:
+                continue
+            selected_list.append(tournament_id)
+            selected_names[tournament_id] = name
+            if len(selected_list) >= limit:
+                break
+        selected = tuple(selected_list[:limit])
         if selected:
             LOGGER.info(
-                "Resolved OddsPapi tournament IDs %s for %r (%s)",
+                "Resolved OddsPapi tournament ID candidates %s for %r (%s)",
                 ",".join(selected),
                 search,
-                "; ".join(f"{name}:{tid}" for _, tid, name in scored[:limit]),
+                "; ".join(f"{selected_names.get(tid, tid)}:{tid}" for tid in selected),
             )
         else:
             sample = ", ".join(
@@ -1584,6 +1630,19 @@ def http_retry_delay(body: str) -> float | None:
         if number is not None:
             return max(0.1, min(30.0, number + 0.1))
     return None
+
+
+def oddspapi_fixture_not_found(error: HTTPRequestError) -> bool:
+    if error.status_code != 404:
+        return False
+    try:
+        payload = json.loads(error.body)
+    except (TypeError, ValueError):
+        return False
+    details = payload.get("error") if isinstance(payload, Mapping) else None
+    if not isinstance(details, Mapping):
+        return False
+    return clean_text_or_none(details.get("code")) == "FIXTURE_NOT_FOUND"
 
 
 def env_str(name: str, default: str) -> str:

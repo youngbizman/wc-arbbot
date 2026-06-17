@@ -117,7 +117,7 @@ jobs:
       ODDSPAPI_TOURNAMENT_IDS: ${{ inputs.oddspapi_tournament_ids || vars.ODDSPAPI_TOURNAMENT_IDS }}
       ODDSPAPI_TOURNAMENT_SEARCH: ${{ inputs.oddspapi_tournament_search || vars.ODDSPAPI_TOURNAMENT_SEARCH || vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
       ODDSPAPI_TOURNAMENT_NAME: ${{ inputs.oddspapi_tournament_search || vars.ODDSPAPI_TOURNAMENT_NAME || 'FIFA World Cup' }}
-      ODDSPAPI_MAX_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_MAX_TOURNAMENT_IDS || '1' }}
+      ODDSPAPI_MAX_TOURNAMENT_IDS: ${{ vars.ODDSPAPI_MAX_TOURNAMENT_IDS || '3' }}
       ODDSPAPI_BOOKMAKERS: ${{ inputs.oddspapi_bookmakers || vars.ODDSPAPI_BOOKMAKERS || 'pinnacle,1xbet' }}
       ODDSPAPI_LIVE_MODE: ${{ vars.ODDSPAPI_LIVE_MODE || 'poll' }}
       ODDSPAPI_REST_POLL_SECONDS: ${{ vars.ODDSPAPI_REST_POLL_SECONDS || '60' }}

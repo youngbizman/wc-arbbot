@@ -1280,7 +1280,11 @@ class LiveSignaler:
             f"Top alerts per digest: {self.config.max_alerts_per_digest}"
         )
         if cross_platform_clusters == 0:
-            message += "\nNo cross-platform overlaps were mapped yet; waiting for OddsPapi/Pinnacle/1xBet overlap data."
+            message += (
+                "\nNo verified betting signals are available from this run."
+                "\nReason: no cross-platform overlaps were mapped yet; OddsPapi/Pinnacle/1xBet coverage is still empty."
+                "\nDo not place bets from this startup status message."
+            )
         if self.config.dry_run or not self.engine.telegram:
             LOGGER.info(message.replace("\n", " | "))
             return
