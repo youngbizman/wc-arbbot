@@ -1016,7 +1016,12 @@ class OddsPapiIndexer(BaseIndexer):
                     )
                 ) or clean_text_or_none(first_present(outcome_payload, "bookmakerOutcomeId", "name", "label"))
                 player_name = clean_text_or_none(first_present(player_payload, "playerName", "participantName"))
-                outcome_name = odds_papi_outcome_name(bookmaker_outcome_id or outcome_key, home_name, away_name)
+                outcome_label = odds_papi_moneyline_outcome_label(
+                    market_key,
+                    outcome_key,
+                    bookmaker_outcome_id or outcome_key,
+                )
+                outcome_name = odds_papi_outcome_name(outcome_label, home_name, away_name)
                 if player_name:
                     outcome_name = f"{player_name} {outcome_name}"
                 decimal_odds = safe_float(
@@ -1029,7 +1034,7 @@ class OddsPapiIndexer(BaseIndexer):
                     MarketOutcome(
                         outcome_id=normalized_outcome_id,
                         name=outcome_name,
-                        platform_outcome_id=bookmaker_outcome_id,
+                        platform_outcome_id=outcome_label,
                         decimal_odds=decimal_odds,
                         probability=1.0 / decimal_odds,
                         limit=safe_float(first_present(player_payload, "limit", "maxBet", "maxStake")),
@@ -1059,10 +1064,12 @@ class OddsPapiIndexer(BaseIndexer):
             return None
         selections = unwrap_list(first_present(market, "outcomes", "selections", "prices", "runners"))
         outcomes: list[MarketOutcome] = []
+        home_name, away_name = odds_papi_participant_names(event, {})
         for idx, selection in enumerate(only_mappings(selections)):
             name = clean_text_or_none(first_present(selection, "name", "label", "selection", "outcome"))
             if not name:
                 continue
+            name = odds_papi_outcome_name(name, home_name, away_name)
             decimal_odds = safe_float(
                 first_present(selection, "decimal", "decimalOdds", "price", "odds", "value")
             )
@@ -1096,7 +1103,7 @@ class OddsPapiIndexer(BaseIndexer):
             event_id=event_id,
             event_name=event_name,
             market_name=market_name,
-            market_type=market_key,
+            market_type=odds_papi_market_type(market_key, market),
             outcomes=tuple(outcomes),
             start_time=start_time,
             close_time=parse_datetime(first_present(market, "closeTime", "endsAt")),
@@ -1782,6 +1789,24 @@ def odds_papi_market_name(market_key: str | None, market: Mapping[str, Any]) -> 
         clean_text_or_none(first_present(market, "name", "marketName", "label", "bookmakerMarketId"))
         or f"Market {market_key or 'unknown'}"
     )
+
+
+def odds_papi_moneyline_outcome_label(market_key: str | None, outcome_key: str | None, fallback: str) -> str:
+    label = clean_text_or_none(fallback) or clean_text_or_none(outcome_key) or "Outcome"
+    if market_key != "101":
+        return label
+    lower = label.lower().strip()
+    if lower in {"home", "draw", "away"}:
+        return lower
+    mapped = {
+        "101": "home",
+        "102": "draw",
+        "103": "away",
+        "1": "home",
+        "x": "draw",
+        "2": "away",
+    }
+    return mapped.get(str(outcome_key or "").lower().strip(), label)
 
 
 def odds_papi_outcome_name(raw_label: str, home_name: str | None, away_name: str | None) -> str:

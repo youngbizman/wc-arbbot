@@ -79,9 +79,12 @@ TEAM_ALIASES = {
     "can": "canada",
     "cabo verde": "cape verde",
     "cap verde": "cape verde",
+    "congo dr": "democratic republic of the congo",
+    "congo d r": "democratic republic of the congo",
     "curacao": "curacao",
     "czech republic": "czechia",
     "cze": "czechia",
+    "cote d ivoire": "ivory coast",
     "dr congo": "democratic republic of the congo",
     "drc": "democratic republic of the congo",
     "eng": "england",
@@ -422,9 +425,11 @@ class MarketMapper:
         market_type_raw = str(raw.get("market_type") or raw.get("marketType") or "")
         parent_event_name = str(raw.get("parent_event_name") or raw.get("parentEventName") or "")
         full_text = " ".join(part for part in (event_name, market_name, market_type_raw, parent_event_name) if part)
-        participant_text = " ".join(part for part in (event_name, parent_event_name) if part)
-
-        participants = extract_participants(participant_text) or extract_participants(full_text)
+        participants = (
+            extract_participants(event_name)
+            or extract_participants(parent_event_name)
+            or extract_participants(full_text)
+        )
         event_scope = infer_event_scope(full_text, participants)
         market_type = infer_market_type(market_type_raw, market_name, parent_event_name)
         period = infer_period(full_text)
@@ -520,6 +525,16 @@ class MarketMapper:
         right: NormalizedMarket,
         semantic_score: float | None,
     ) -> MatchCandidate:
+        if core_match_market(left, right) and hard_participant_mismatch(left, right):
+            return MatchCandidate(
+                left_id=left_id,
+                right_id=right_id,
+                left_platform=left.platform,
+                right_platform=right.platform,
+                score=0.0,
+                reasons={"participant": 0.0},
+            )
+
         left_text = normalize_text(
             f"{left.event_name} {left.market_name} {left.market_type}",
             q=self.config.qgram_size,
@@ -665,8 +680,9 @@ def jaccard(left: set[str] | frozenset[str], right: set[str] | frozenset[str]) -
 
 
 def extract_participants(text: str) -> tuple[str, ...]:
+    parsed = parse_vs_participants(text)
     normalized = normalize_text(text).normalized
-    found: set[str] = set()
+    found: set[str] = set(parsed)
     for alias, canonical in TEAM_ALIASES.items():
         alias_norm = normalize_text(alias).normalized
         canonical_norm = normalize_text(canonical).normalized
@@ -675,14 +691,54 @@ def extract_participants(text: str) -> tuple[str, ...]:
         if re.search(rf"\b{re.escape(canonical_norm)}\b", normalized):
             found.add(canonical_norm)
 
-    vs_match = re.search(r"(.+?)\s+(?:vs|v)\s+(.+?)(?:\s+[-|:]|\?|$)", text.lower())
-    if vs_match:
-        for side in (vs_match.group(1), vs_match.group(2)):
-            side_norm = normalize_text(side).normalized
-            if side_norm:
-                found.add(side_norm)
-
     return tuple(sorted(found))
+
+
+def parse_vs_participants(text: str) -> tuple[str, ...]:
+    if not text:
+        return ()
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    compact = re.sub(r"\s+", " ", ascii_text).strip()
+    patterns = [
+        r"^(.{2,80}?)\s+(?:vs\.?|v\.?|versus)\s+(.{2,80}?)(?:\s+[-|:;]\s+|\s+\(|\?|$)",
+        r"\b(.{2,80}?)\s+(?:vs\.?|v\.?|versus)\s+(.{2,80}?)(?:\s+[-|:;]\s+|\s+\(|\?|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, compact, flags=re.IGNORECASE)
+        if not match:
+            continue
+        participants = []
+        for side in (match.group(1), match.group(2)):
+            participant = canonical_participant(side)
+            if participant:
+                participants.append(participant)
+        if len(participants) >= 2:
+            return tuple(sorted(dict.fromkeys(participants)))
+    return ()
+
+
+def canonical_participant(value: str) -> str:
+    cleaned = re.sub(
+        r"\b(?:fifa|world cup|2026|group [a-z]|group stage|match|game|fixture)\b",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:moneyline|match winner|full time result|fulltime result|total goals|handicap|spread|odds)\b.*$",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    normalized = normalize_text(cleaned).normalized
+    if not normalized:
+        return ""
+    for alias, canonical in TEAM_ALIASES.items():
+        alias_norm = normalize_text(alias).normalized
+        canonical_norm = normalize_text(canonical).normalized
+        if normalized in {alias_norm, canonical_norm}:
+            return canonical_norm
+    return normalized
 
 
 def infer_event_scope(text: str, participants: Sequence[str]) -> str:
@@ -891,10 +947,28 @@ def player_threshold(text: str) -> str:
 
 def hard_entity_overlap(left: NormalizedMarket, right: NormalizedMarket) -> bool:
     if left.participants and right.participants:
+        if len(left.participants) >= 2 and len(right.participants) >= 2:
+            return set(left.participants) == set(right.participants)
         return bool(set(left.participants) & set(right.participants))
     left_outcomes = {outcome.normalized_name for outcome in left.outcomes if outcome.normalized_name}
     right_outcomes = {outcome.normalized_name for outcome in right.outcomes if outcome.normalized_name}
     return bool(left_outcomes & right_outcomes)
+
+
+def core_match_market(left: NormalizedMarket, right: NormalizedMarket) -> bool:
+    core_types = {"moneyline", "total_goals", "handicap", "draw_no_bet", "both_teams_to_score"}
+    return (
+        left.event_scope == "match"
+        and right.event_scope == "match"
+        and left.market_type in core_types
+        and right.market_type in core_types
+    )
+
+
+def hard_participant_mismatch(left: NormalizedMarket, right: NormalizedMarket) -> bool:
+    left_set = set(left.participants)
+    right_set = set(right.participants)
+    return len(left_set) >= 2 and len(right_set) >= 2 and left_set != right_set
 
 
 def participant_similarity(left: Sequence[str], right: Sequence[str]) -> float:
@@ -904,6 +978,8 @@ def participant_similarity(left: Sequence[str], right: Sequence[str]) -> float:
         return 0.6
     if not left_set or not right_set:
         return 0.2
+    if len(left_set) >= 2 and len(right_set) >= 2:
+        return 1.0 if left_set == right_set else 0.0
     if left_set == right_set:
         return 1.0
     if left_set & right_set:

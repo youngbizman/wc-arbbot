@@ -133,6 +133,7 @@ jobs:
       SIGNAL_MAX_ALERTS_PER_DIGEST: ${{ inputs.max_alerts_per_digest || vars.SIGNAL_MAX_ALERTS_PER_DIGEST || '2' }}
       SIGNAL_ALERT_DIGEST_SECONDS: ${{ inputs.alert_digest_seconds || vars.SIGNAL_ALERT_DIGEST_SECONDS || '60' }}
       SIGNAL_ALERT_COOLDOWN_SECONDS: ${{ inputs.alert_cooldown_seconds || vars.SIGNAL_ALERT_COOLDOWN_SECONDS || '600' }}
+      SIGNAL_QUOTE_STALE_SECONDS: ${{ vars.SIGNAL_QUOTE_STALE_SECONDS || '120' }}
       SIGNAL_DRY_RUN: ${{ inputs.dry_run || vars.SIGNAL_DRY_RUN || 'false' }}
       SIGNAL_ALLOW_EMPTY_TAXONOMY: "false"
 
@@ -276,6 +277,7 @@ jobs:
             -e SIGNAL_MAX_ALERTS_PER_DIGEST \
             -e SIGNAL_ALERT_DIGEST_SECONDS \
             -e SIGNAL_ALERT_COOLDOWN_SECONDS \
+            -e SIGNAL_QUOTE_STALE_SECONDS \
             -e SIGNAL_DRY_RUN \
             -e SIGNAL_ALLOW_EMPTY_TAXONOMY \
             wc-arbbot:latest

@@ -61,7 +61,7 @@ class SignalerConfig:
     taxonomy_path: Path
     target_payout_usd: float = 500.0
     min_profit_pct: float = 1.5
-    quote_stale_seconds: float = 5.0
+    quote_stale_seconds: float = 120.0
     alert_cooldown_seconds: float = 120.0
     reconnect_initial_seconds: float = 1.0
     reconnect_max_seconds: float = 60.0
@@ -136,6 +136,7 @@ class InstrumentRef:
     instrument_id: str
     event_name: str
     market_name: str
+    participants: tuple[str, ...] = ()
     event_time: str | None = None
     market_type: str | None = None
     line: float | None = None
@@ -357,6 +358,7 @@ class TaxonomyStore:
                     instrument_id=instrument_id,
                     event_name=str(source.get("event_name") or market.get("event_name") or ""),
                     market_name=str(source.get("market_name") or market.get("market_name") or ""),
+                    participants=tuple(str(item) for item in market.get("participants") or ()),
                     event_time=event_time,
                     market_type=market_type_for_ref,
                     line=float_or_none(market.get("line") or source.get("line")),
@@ -382,7 +384,8 @@ class TaxonomyStore:
     ) -> set[str]:
         aliases = {ref.quote_key}
         if ref.platform in GLOBALLY_UNIQUE_INSTRUMENT_PLATFORMS:
-            aliases.add(ref.instrument_id)
+            if globally_unique_instrument_alias(ref.instrument_id, ref.outcome_key):
+                aliases.add(ref.instrument_id)
             aliases.add(f"{ref.platform}:{ref.market_id}")
             aliases.add(f"{ref.platform}:{ref.market_id}:{ref.instrument_id}")
         else:
@@ -397,10 +400,27 @@ class TaxonomyStore:
             or outcome.get("id")
             or ""
         )
+        source_raw = as_mapping(source.get("raw"))
+        source_market_raw = as_mapping(source_raw.get("market"))
+        outcome_raw = as_mapping(outcome.get("raw"))
+        player_raw = as_mapping(outcome_raw.get("player"))
+        raw_market_id = str(
+            outcome_raw.get("marketId")
+            or source_market_raw.get("marketId")
+            or source_market_raw.get("id")
+            or ""
+        )
+        raw_player_id = str(player_raw.get("playerId") or player_raw.get("id") or "")
         if event_id and ref.platform not in GLOBALLY_UNIQUE_INSTRUMENT_PLATFORMS:
             aliases.add(f"{ref.platform}:{event_id}:{market_type}:{ref.outcome_id}")
             aliases.add(f"{ref.platform}:{event_id}:{market_type}:{platform_outcome_id}")
             aliases.add(f"{ref.platform}:{event_id}:{ref.market_id}:{ref.outcome_id}")
+            if raw_market_id:
+                aliases.add(f"{ref.platform}:{event_id}:{raw_market_id}:{ref.outcome_id}")
+                aliases.add(f"{ref.platform}:{event_id}:{raw_market_id}:{platform_outcome_id}")
+                if raw_player_id:
+                    aliases.add(f"{ref.platform}:{event_id}:{raw_market_id}:{ref.outcome_id}:{raw_player_id}")
+                    aliases.add(f"{ref.platform}:{event_id}:{raw_market_id}:{platform_outcome_id}:{raw_player_id}")
         return {alias for alias in aliases if alias and alias != "None"}
 
     def aliases(self, *parts: Any) -> list[str]:
@@ -514,12 +534,15 @@ class SignalEngine:
         for quote in quotes:
             grouped[quote.ref.outcome_key].append(quote)
 
+        market_type = first_non_empty(quote.ref.market_type or "" for quote in quotes)
         outcome_keys = choose_covering_outcomes(
             grouped.keys(),
-            market_type=first_non_empty(quote.ref.market_type or "" for quote in quotes),
+            market_type=market_type,
             assume_multigroup_exhaustive=self.config.assume_multigroup_exhaustive,
             min_multi_outcomes=self.config.min_multi_outcomes,
         )
+        if market_type == "moneyline":
+            outcome_keys = moneyline_expected_outcomes(quotes, grouped.keys()) or ()
         if not outcome_keys:
             return None
 
@@ -1111,9 +1134,12 @@ class OddsPapiListener(ReconnectingListener):
         price = float_or_none(payload.get("price") or payload.get("decimalOdds") or payload.get("odds"))
         if not price or price <= 1:
             return
+        platform_outcome_id = payload.get("bookmakerOutcomeId") or payload.get("outcomeName")
         aliases = [
             f"{bookmaker}:{fixture_id}:{market_id}:{outcome_id}:{player_id}",
             f"{bookmaker}:{fixture_id}:{market_id}:{outcome_id}",
+            f"{bookmaker}:{fixture_id}:{market_id}:{platform_outcome_id}:{player_id}",
+            f"{bookmaker}:{fixture_id}:{market_id}:{platform_outcome_id}",
             f"{bookmaker}:{market_id}:{outcome_id}:{player_id}",
             f"{bookmaker}:{market_id}:{outcome_id}",
         ]
@@ -1206,6 +1232,16 @@ class OddsPapiRestPollingListener(ReconnectingListener):
                     f"{platform}:{market.event_id}:{market.market_type}:{outcome.outcome_id}",
                     f"{platform}:{market.event_id}:{market.market_type}:{outcome.platform_outcome_id}",
                 ]
+                raw_market = as_mapping(market.raw.get("market")) if isinstance(market.raw, Mapping) else {}
+                raw_outcome = as_mapping(outcome.raw) if isinstance(outcome.raw, Mapping) else {}
+                raw_market_id = raw_outcome.get("marketId") or raw_market.get("marketId") or raw_market.get("id")
+                if raw_market_id:
+                    aliases.extend(
+                        [
+                            f"{platform}:{market.event_id}:{raw_market_id}:{outcome.outcome_id}",
+                            f"{platform}:{market.event_id}:{raw_market_id}:{outcome.platform_outcome_id}",
+                        ]
+                    )
                 await self.engine.update_fixed_odds(
                     aliases=[alias for alias in aliases if alias and "None" not in alias],
                     decimal_odds=decimal_odds,
@@ -1325,6 +1361,28 @@ def choose_covering_outcomes(
     if assume_multigroup_exhaustive and len(key_set) >= min_multi_outcomes:
         return tuple(sorted(key_set))
     return ()
+
+
+def moneyline_expected_outcomes(
+    quotes: Sequence[LiveQuote],
+    available_keys: Iterable[str],
+) -> tuple[str, ...]:
+    if first_non_empty(quote.ref.market_type or "" for quote in quotes) != "moneyline":
+        return ()
+    available = {normalize_outcome_key(key) for key in available_keys if key}
+    participant_sets = [
+        {normalize_outcome_key(participant) for participant in quote.ref.participants if participant}
+        for quote in quotes
+        if len(quote.ref.participants) >= 2
+    ]
+    if not participant_sets:
+        return ()
+    expected = set(max(participant_sets, key=len))
+    if not expected:
+        return ()
+    if "draw" in available:
+        expected.add("draw")
+    return tuple(sorted(expected)) if expected.issubset(available) else ()
 
 
 def normalize_outcome_key(value: Any) -> str:
@@ -1477,6 +1535,18 @@ def fixed_odds_alias_is_ambiguous(refs: Sequence[InstrumentRef]) -> bool:
     market_ids = {ref.market_id for ref in fixed_refs}
     outcome_keys = {ref.outcome_key for ref in fixed_refs}
     return len(canonical_ids) > 1 or len(market_ids) > 1 or len(outcome_keys) > 1
+
+
+def globally_unique_instrument_alias(instrument_id: str, outcome_key: str) -> bool:
+    value = str(instrument_id or "").strip()
+    if not value:
+        return False
+    lower = value.lower()
+    if lower == normalize_outcome_key(outcome_key):
+        return False
+    if lower in {"yes", "no", "draw", "home", "away", "over", "under", "1", "2", "x"}:
+        return False
+    return ":" in value or len(value) >= 12
 
 
 def chunks(items: Sequence[str], size: int) -> Iterable[Sequence[str]]:
